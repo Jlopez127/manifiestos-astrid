@@ -14,6 +14,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import dropbox
 import streamlit as st
+import numpy as np
 
 st.set_page_config(page_title="Manifiestos Astrid", layout="wide")
 
@@ -101,8 +102,28 @@ if run:
     # 1) Leer histórico de Dropbox
     # -----------------------------
     dbx = get_dbx()
-    _, res = dbx.files_download(DBX_FILE_PATH)
-    df_historico = pd.read_excel(io.BytesIO(res.content), sheet_name=0)
+    def load_historico_or_empty(dbx: dropbox.Dropbox, path: str) -> pd.DataFrame:
+        # Columnas mínimas esperadas del histórico
+        base_cols = [
+            "FECHA GUIA", "guia", "COMPAÑÍA REMITENTE", "REMITENTE DIRECCION", "REMITENTE TELEFONO",
+            "REMITENTE CIUDAD", "REMITENTE ESTADO", "NOMBRE DESTINO", "DESTINO DIRECCION",
+            "DESTINO TELEFONO", "DESTINO CIUDAD", "CONTENIDO", "PESO LIBRAS", "PESO KILOS",
+            "VALOR DECLARADO", "PIEZAS", "DESTINO ESTADO", "POSICION ARANCELARIA", "MANIFIESTO","INSTRUCCIONES",
+            "CASILLERO"  # útil para lógica de manifiesto
+        ]
+        try:
+            _, res = dbx.files_download(path)
+            df = pd.read_excel(io.BytesIO(res.content), sheet_name=0)
+            # asegurar columna guia si viene como GUIA u otra variante
+            if "guia" not in df.columns and "GUIA" in df.columns:
+                df = df.rename(columns={"GUIA": "guia"})
+            return df
+        except dropbox.exceptions.ApiError as e:
+            # si no existe, arrancar vacío
+            if getattr(e, "error", None) and e.error.is_path() and e.error.get_path().is_not_found():
+                return pd.DataFrame(columns=base_cols)
+            raise  # cualquier otro error sí lo mostramos
+    df_historico = load_historico_or_empty(dbx, DBX_FILE_PATH)
 
     st.success(f"Histórico descargado: {df_historico.shape[0]} filas")
 
@@ -124,12 +145,13 @@ if run:
     # 4) Renombres remitente
     # -----------------------------
     rename_map = {
-        "Nombre": "COMPAÑÍA REMITENTE",
-        "Direccion": "REMITENTE DIRECCION",
-        "Telefono": "REMITENTE TELEFONO",
-        "Ciudad": "REMITENTE CIUDAD",
-        "Departamento": "REMITENTE ESTADO",
+        "CLIENTE": "COMPAÑÍA REMITENTE",
+        "DIRECCIÓN DESTINO": "REMITENTE DIRECCION",
+        "TELÉFONO": "REMITENTE TELEFONO",
+        "CIUDAD DESTINO": "REMITENTE CIUDAD",
+        "DEPARTAMENTO DESTINO": "REMITENTE ESTADO",
     }
+
     faltantes = [c for c in rename_map.keys() if c not in df_b.columns]
     if faltantes:
         st.error(f"Faltan columnas en B: {faltantes}")
@@ -154,6 +176,8 @@ if run:
 
     df_a["guia"] = _clean_str_series(df_a["guia"])
     df_b["guia"] = _clean_str_series(df_b["guia"])
+    if "CATEGORÍAS PRODUCTOS" in df_b.columns:
+        df_b = df_b.rename(columns={"CATEGORÍAS PRODUCTOS": "CONTENIDO"})
 
     # -----------------------------
     # 7) Selección columnas B + PESO -> PESO LIBRAS
@@ -184,12 +208,19 @@ if run:
     # 8) Merge
     # -----------------------------
     df_final = df_a.merge(df_b_sel, how="left", on="guia")
+    # -----------------------------
+# 8.1) Columnas nuevas
+# -----------------------------
+    df_final["PIEZAS"] = 1
+    df_final["VALOR DECLARADO"] = np.random.randint(91, 100, size=len(df_final))  # 91–99
+    df_final["POSICION ARANCELARIA"] = "980720"
+    df_final["POSICION ARANCELARIA"] = df_final["POSICION ARANCELARIA"].astype("string")
 
     # -----------------------------
     # 9) PESO KILOS + FECHA GUIA Miami
     # -----------------------------
     df_final["PESO LIBRAS"] = pd.to_numeric(df_final["PESO LIBRAS"], errors="coerce")
-    df_final["PESO KILOS"] = df_final["PESO LIBRAS"] * 2.2
+    df_final["PESO KILOS"] = df_final["PESO LIBRAS"] / 2.2
 
     hoy_miami = datetime.now(ZoneInfo("America/New_York")).date()
     df_final["FECHA GUIA"] = pd.to_datetime(hoy_miami)
@@ -231,6 +262,37 @@ if run:
 
     df_concat["MANIFIESTO"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce").astype("Int64")
     df_concat = df_concat.drop(columns=["CASILLERO_NORM", "MANIFIESTO_NUM"], errors="ignore")
+    # -----------------------------
+    # 11.5) Reordenar columnas para export
+    # -----------------------------
+    orden_cols = [
+        "FECHA GUIA",
+        "guia",
+        "COMPAÑÍA REMITENTE",
+        "REMITENTE DIRECCION",
+        "REMITENTE TELEFONO",
+        "REMITENTE CIUDAD",
+        "REMITENTE ESTADO",
+        "NOMBRE DESTINO",
+        "DESTINO DIRECCION",
+        "DESTINO TELEFONO",
+        "DESTINO CIUDAD",
+        "CONTENIDO",
+        "PESO LIBRAS",
+        "PESO KILOS",
+        "VALOR DECLARADO",
+        "PIEZAS",
+        "DESTINO ESTADO",
+        "POSICION ARANCELARIA",
+        "MANIFIESTO",
+        "INSTRUCCIONES",
+        "CASILLERO"
+    ]
+    
+    # solo deja las que existan (por si el histórico viejo trae extras)
+    presentes = [c for c in orden_cols if c in df_concat.columns]
+    extras = [c for c in df_concat.columns if c not in presentes]
+    df_concat = df_concat[presentes + extras]
 
     st.success(f"Manifiestos asignados. Nuevo 11591={nuevo_man_11591} | Otros={nuevo_man_otros}")
 
@@ -267,57 +329,104 @@ else:
     df_concat = st.session_state["df_concat"]
     fecha_str = st.session_state.get("fecha_str") or datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
-    manifiestos = (
-        df_concat["MANIFIESTO"]
-        .dropna()
-        .astype("int64")
-        .sort_values()
-        .unique()
-        .tolist()
-    )
+    # -----------------------------
+    # Vista SOLO para descargas (no afecta Dropbox)
+    # - omite CASILLERO
+    # - ordena columnas
+    # - renombra guia -> GUIA
+    # -----------------------------
+    df_dl = df_concat.copy()
+    df_dl = df_dl.drop(columns=["CASILLERO"], errors="ignore")
 
-    def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "DATA") -> bytes:
-        out = io.BytesIO()
-        with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-        out.seek(0)
-        return out.getvalue()
+    if "guia" in df_dl.columns:
+        df_dl = df_dl.rename(columns={"guia": "GUIA"})
 
-    def build_zip_all_manifiestos(df_all: pd.DataFrame) -> bytes:
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for man in df_all["MANIFIESTO"].dropna().astype("int64").sort_values().unique().tolist():
-                df_m = df_all[df_all["MANIFIESTO"].astype("Int64") == man].copy()
-                excel_bytes = df_to_excel_bytes(df_m, sheet_name=f"MAN_{man}")
-                zf.writestr(f"{fecha_str}-{man}.xlsx", excel_bytes)
-        zip_buf.seek(0)
-        return zip_buf.getvalue()
+    orden_descarga = [
+        "FECHA GUIA",
+        "GUIA",
+        "COMPAÑÍA REMITENTE",
+        "REMITENTE DIRECCION",
+        "REMITENTE TELEFONO",
+        "REMITENTE CIUDAD",
+        "REMITENTE ESTADO",
+        "NOMBRE DESTINO",
+        "DESTINO DIRECCION",
+        "DESTINO TELEFONO",
+        "DESTINO CIUDAD",
+        "CONTENIDO",
+        "PESO LIBRAS",
+        "PESO KILOS",
+        "VALOR DECLARADO",
+        "PIEZAS",
+        "DESTINO ESTADO",
+        "POSICION ARANCELARIA",
+        "MANIFIESTO",
+        "INSTRUCCIONES"
+    ]
 
-    col_all, col_one = st.columns([1, 1])
+    presentes = [c for c in orden_descarga if c in df_dl.columns]
+    extras = [c for c in df_dl.columns if c not in presentes]
+    df_dl = df_dl[presentes + extras]
 
-    with col_all:
-        st.markdown("**Descargar todos (ZIP)**")
-        if st.button("Preparar ZIP con todos los manifiestos"):
-            zip_bytes = build_zip_all_manifiestos(df_concat)
-            st.download_button(
-                "Descargar ZIP",
-                data=zip_bytes,
-                file_name=f"{fecha_str}-manifiestos.zip",
-                mime="application/zip",
-            )
+    # Lista de manifiestos disponibles (ordenados, sin nulos)
+    if "MANIFIESTO" not in df_dl.columns:
+        st.warning("No existe la columna MANIFIESTO en el histórico para descargas.")
+    else:
+        manifiestos = (
+            df_dl["MANIFIESTO"]
+            .dropna()
+            .astype("int64")
+            .sort_values()
+            .unique()
+            .tolist()
+        )
 
-    with col_one:
-        st.markdown("**Descargar uno puntual**")
-        if not manifiestos:
-            st.info("No hay manifiestos disponibles para descargar.")
-        else:
-            man_sel = st.selectbox("Buscar/seleccionar manifiesto", options=manifiestos)
-            df_sel = df_concat[df_concat["MANIFIESTO"].astype("Int64") == int(man_sel)].copy()
-            excel_sel = df_to_excel_bytes(df_sel, sheet_name=f"MAN_{man_sel}")
+        def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "DATA") -> bytes:
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+            out.seek(0)
+            return out.getvalue()
 
-            st.download_button(
-                f"Descargar {fecha_str}-{man_sel}.xlsx",
-                data=excel_sel,
-                file_name=f"{fecha_str}-{man_sel}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+        def build_zip_all_manifiestos(df_all: pd.DataFrame) -> bytes:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for man in (
+                    df_all["MANIFIESTO"].dropna().astype("int64").sort_values().unique().tolist()
+                ):
+                    df_m = df_all[df_all["MANIFIESTO"].astype("Int64") == man].copy()
+                    excel_bytes = df_to_excel_bytes(df_m, sheet_name=f"MAN_{man}")
+                    filename = f"{fecha_str}-{man}.xlsx"
+                    zf.writestr(filename, excel_bytes)
+            zip_buf.seek(0)
+            return zip_buf.getvalue()
+
+        col_all, col_one = st.columns([1, 1])
+
+        with col_all:
+            st.markdown("**Descargar todos (ZIP)**")
+            if st.button("Preparar ZIP con todos los manifiestos"):
+                zip_bytes = build_zip_all_manifiestos(df_dl)
+                st.download_button(
+                    "Descargar ZIP",
+                    data=zip_bytes,
+                    file_name=f"{fecha_str}-manifiestos.zip",
+                    mime="application/zip",
+                )
+
+        with col_one:
+            st.markdown("**Descargar uno puntual**")
+            if not manifiestos:
+                st.info("No hay manifiestos disponibles para descargar.")
+            else:
+                man_sel = st.selectbox("Buscar/seleccionar manifiesto", options=manifiestos)
+
+                df_sel = df_dl[df_dl["MANIFIESTO"].astype("Int64") == int(man_sel)].copy()
+                excel_sel = df_to_excel_bytes(df_sel, sheet_name=f"MAN_{man_sel}")
+
+                st.download_button(
+                    f"Descargar {fecha_str}-{man_sel}.xlsx",
+                    data=excel_sel,
+                    file_name=f"{fecha_str}-{man_sel}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
