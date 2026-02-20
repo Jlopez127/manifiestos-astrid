@@ -139,6 +139,8 @@ if run:
     # 3) Asegurar STR + limpieza .0 en llaves originales
     # -----------------------------
     df_a["Envio"] = _clean_str_series(df_a["Envio"])
+    df_a = df_a.drop_duplicates(subset=["Envio"], keep="first").copy()
+    
     df_b["NUMERO ENVIO"] = _clean_str_series(df_b["NUMERO ENVIO"])
 
     # -----------------------------
