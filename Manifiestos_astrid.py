@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 import dropbox
 import streamlit as st
 import numpy as np
+import json
+from openai import OpenAI
 
 st.set_page_config(page_title="Manifiestos Astrid", layout="wide")
 
@@ -89,14 +91,19 @@ def _norm_casillero(x) -> str:
 # -----------------------------
 st.title("Manifiestos Astrid")
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
     up_a = st.file_uploader("Sube Pistoleo de bodega (Envios pistoleo)", type=["xlsx", "xls"])
 with col2:
     up_b = st.file_uploader("Sube Envíos Encargomio (Envios_Encargomio)", type=["xlsx", "xls"])
+with col3:
+    up_p = st.file_uploader("Sube Productos por casillero", type=["xlsx", "xls"])
 
-run = st.button("Procesar y actualizar histórico en Dropbox", type="primary", disabled=not (up_a and up_b))
-
+run = st.button(
+    "Procesar y actualizar histórico en Dropbox",
+    type="primary",
+    disabled=not (up_a and up_b and up_p)
+)
 if run:
     # -----------------------------
     # 1) Leer histórico de Dropbox
@@ -295,6 +302,246 @@ if run:
     presentes = [c for c in orden_cols if c in df_concat.columns]
     extras = [c for c in df_concat.columns if c not in presentes]
     df_concat = df_concat[presentes + extras]
+    # -----------------------------
+    # X) COSTO (se guarda en Dropbox)
+    # -----------------------------
+    df_concat["PESO LIBRAS"] = pd.to_numeric(df_concat["PESO LIBRAS"], errors="coerce")
+    w = df_concat["PESO LIBRAS"]
+    
+    df_concat["COSTO"] = np.where(
+        w.isna() | (w <= 0),
+        0,
+        np.where(
+            w <= 1,
+            7.35,
+            7.35 + (w - 1) * 2.6
+        ) + np.where(w >= 20, 4.75, 0)
+    ).round(2)
+    
+    
+    
+    # -----------------------------
+    # X) Resumen COSTO por manifiesto (para hoja 2)
+    # -----------------------------
+    # Asegurar numéricos
+    for col in ["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]:
+        if col in df_concat.columns:
+            df_concat[col] = pd.to_numeric(df_concat[col], errors="coerce")
+    
+    df_costos_manifiesto = (
+        df_concat
+        .groupby("MANIFIESTO", dropna=False, as_index=False)[["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]]
+        .sum(min_count=1)
+    )
+    
+    # (opcional) ordenar
+    df_costos_manifiesto = df_costos_manifiesto.sort_values("MANIFIESTO", na_position="last")
+    
+    
+    
+    
+    # =========================
+    # PRODUCTOS -> PRODUCTOS_RAW (solo si CONTENIDO está vacío)
+    # =========================
+    
+    # 0) Cargar archivo productos (si ya lo tienes, omite esta línea)
+# =========================
+# PRODUCTOS (df_p) -> resumen por Envio usando Peso
+# y cruce SOLO para filas sin CONTENIDO
+# =========================
+
+# df_p ya leído (si no:)
+    df_p = pd.read_excel(up_p)
+    
+    COL_ENVIO = "Envío"
+    COL_PROD  = "Nombre producto"
+    COL_PESO  = "Peso"
+    
+    df_prod = df_p[[COL_ENVIO, COL_PROD, COL_PESO]].copy()
+    
+    df_prod[COL_ENVIO] = _clean_str_series(df_prod[COL_ENVIO])
+    df_prod[COL_PROD]  = df_prod[COL_PROD].astype("string").fillna("").str.strip()
+    df_prod[COL_PESO]  = pd.to_numeric(df_prod[COL_PESO], errors="coerce").fillna(0)
+    
+    df_prod = df_prod[df_prod[COL_PROD] != ""].copy()
+    
+    # ✅ DEDUP real: colapsa repetidos (Envio, Producto) sumando Peso
+    df_prod = (
+        df_prod
+        .groupby([COL_ENVIO, COL_PROD], as_index=False)[COL_PESO]
+        .sum()
+    )
+    
+    # Dominante (máximo peso total por envío)
+    idx_dom = df_prod.groupby(COL_ENVIO)[COL_PESO].idxmax()
+    df_dom = (
+        df_prod.loc[idx_dom, [COL_ENVIO, COL_PROD, COL_PESO]]
+        .rename(columns={COL_PROD: "PRODUCTO_DOMINANTE", COL_PESO: "PESO_DOMINANTE"})
+    )
+    
+    # Lista (ordenada por peso desc, ya sin repetidos)
+    df_list = (
+        df_prod.sort_values([COL_ENVIO, COL_PESO], ascending=[True, False])
+        .groupby(COL_ENVIO, as_index=False)[COL_PROD]
+        .apply(lambda s: " | ".join(s.head(50).tolist()))
+        .rename(columns={COL_PROD: "PRODUCTOS_LISTA"})
+    )
+    
+    df_prod_agg = df_dom.merge(df_list, on=COL_ENVIO, how="left")
+    
+    # ----- cruzar solo los que NO tienen contenido -----
+    df_concat_copy = df_concat.copy()
+    
+    df_concat_copy["CONTENIDO"] = df_concat_copy.get(
+        "CONTENIDO", pd.Series([pd.NA] * len(df_concat_copy))
+    ).astype("string")
+    
+    mask_sin_contenido = df_concat_copy["CONTENIDO"].isna() | (df_concat_copy["CONTENIDO"].str.strip() == "")
+    
+    df_to_ai = df_concat_copy.loc[mask_sin_contenido].copy()
+    df_to_ai["guia"] = _clean_str_series(df_to_ai["guia"])
+    
+    df_to_ai = df_to_ai.merge(
+        df_prod_agg,
+        how="left",
+        left_on="guia",
+        right_on=COL_ENVIO
+    )
+    
+    df_concat_copy.loc[mask_sin_contenido, "PRODUCTO_DOMINANTE"] = df_to_ai["PRODUCTO_DOMINANTE"].values
+    df_concat_copy.loc[mask_sin_contenido, "PESO_DOMINANTE"] = df_to_ai["PESO_DOMINANTE"].values
+    df_concat_copy.loc[mask_sin_contenido, "PRODUCTOS_LISTA"] = df_to_ai["PRODUCTOS_LISTA"].values
+    
+    def get_openai_client() -> OpenAI:
+        return OpenAI(api_key=st.secrets["openai"]["api_key"])
+    
+    
+    CATEGORIAS = [
+        "Tenis", "Calzado", "Celular", "Computador", "Componente de computador",
+        "Ropa", "Perfumes", "Cosmeticos", "Accesorios", "Reloj/Joyeria",
+        "Hogar", "Electrodomestico", "Juguetes", "Herramientas",
+        "Suplementos", "Medicamentos", "Alimentos",
+        "Libros/Papeleria", "Miscelaneo"
+    ]
+    
+    # ✅ ESTE es el JSON Schema REAL (raíz type=object)
+    CLASIFICAR_ENVIO_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "categoria": {"type": "string", "enum": CATEGORIAS},
+            "confianza": {"type": "integer", "minimum": 0, "maximum": 100},
+            "contenido": {
+                "type": "string",
+                "description": "Texto corto para CONTENIDO (sin marcas). Ej: 'Calzado (tenis)', 'Celular', 'Ropa'."
+            }
+        },
+        "required": ["categoria", "confianza", "contenido"],
+        "additionalProperties": False
+    }
+    
+    def gpt_clasificar_envio(client: OpenAI, producto_dominante: str, productos_lista: str) -> dict:
+        prompt = f"""
+    Eres un clasificador de envíos para manifiestos.
+    Objetivo: llenar la columna CONTENIDO con una categoria GENERAL, sin marcas.
+    
+    Reglas:
+    - Prioriza PRODUCTO_DOMINANTE (es el más pesado del envío).
+    - Usa PRODUCTOS_LISTA solo como contexto.
+    - NO menciones marcas (Nike, Apple, etc). Solo categoria general.
+    - 'contenido' debe ser corto (1-4 palabras). Puedes aclarar entre paréntesis sin marcas.
+    - Si es muy variado, usa Miscelaneo.
+    
+    PRODUCTO_DOMINANTE: {producto_dominante}
+    PRODUCTOS_LISTA: {productos_lista}
+    """.strip()
+    
+        resp = client.responses.create(
+            model="gpt-4o-mini",
+            input=prompt,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "clasificar_envio",   # <=64 chars
+                    "schema": CLASIFICAR_ENVIO_SCHEMA,
+                    "strict": True
+                }
+            }
+        )
+    
+        # ✅ resp.output_text ya es JSON válido
+        return json.loads(resp.output_text)   
+
+    client = get_openai_client()
+    
+    df_concat_copy["CONTENIDO"] = df_concat_copy.get(
+        "CONTENIDO", pd.Series([pd.NA] * len(df_concat_copy))
+    ).astype("string")
+    
+    mask_sin_contenido = df_concat_copy["CONTENIDO"].isna() | (df_concat_copy["CONTENIDO"].str.strip() == "")
+    
+    mask_listo_para_gpt = (
+        mask_sin_contenido
+        & df_concat_copy["PRODUCTO_DOMINANTE"].notna()
+        & (df_concat_copy["PRODUCTO_DOMINANTE"].astype(str).str.strip() != "")
+    )
+    
+    cache = {}
+    
+    cats, confs, conts = [], [], []
+    
+    for dom, lista in zip(
+        df_concat_copy.loc[mask_listo_para_gpt, "PRODUCTO_DOMINANTE"].astype(str).tolist(),
+        df_concat_copy.loc[mask_listo_para_gpt, "PRODUCTOS_LISTA"].fillna("").astype(str).tolist()
+    ):
+        lista = lista[:3000]  # límite de texto
+        key = (dom, lista)
+    
+        if key in cache:
+            out = cache[key]
+        else:
+            out = gpt_clasificar_envio(client, dom, lista)
+            cache[key] = out
+    
+        cats.append(out["categoria"])
+        confs.append(out["confianza"])
+        conts.append(out["contenido"])
+    
+    df_concat_copy.loc[mask_listo_para_gpt, "CATEGORIA_GPT"] = cats
+    df_concat_copy.loc[mask_listo_para_gpt, "CONF_GPT"] = confs
+    df_concat_copy.loc[mask_listo_para_gpt, "CONTENIDO"] = conts
+    
+    # Si sigue sin match (no había productos), se queda vacío
+
+    # =========================
+    # PASAR CONTENIDO de df_concat_copy -> df_concat (por guia)
+    # =========================
+    
+    # 1) Normalizar llaves (por si acaso)
+    df_concat_copy["guia"] = _clean_str_series(df_concat_copy["guia"])
+    df_concat["guia"] = _clean_str_series(df_concat["guia"])
+    
+    # 2) Asegurar CONTENIDO como string
+    df_concat["CONTENIDO"] = df_concat.get("CONTENIDO", pd.Series([pd.NA]*len(df_concat))).astype("string")
+    df_concat_copy["CONTENIDO"] = df_concat_copy.get("CONTENIDO", pd.Series([pd.NA]*len(df_concat_copy))).astype("string")
+    
+    # 3) Tomar SOLO filas donde df_concat_copy tiene contenido generado (no vacío)
+    mask_copy_con = df_concat_copy["CONTENIDO"].notna() & (df_concat_copy["CONTENIDO"].str.strip() != "")
+    
+    # Si hay duplicados de guia en copy, me quedo con el último no vacío (por seguridad)
+    df_map = (
+        df_concat_copy.loc[mask_copy_con, ["guia", "CONTENIDO"]]
+        .drop_duplicates(subset=["guia"], keep="last")
+    )
+    
+    map_contenido = df_map.set_index("guia")["CONTENIDO"].to_dict()
+    
+    # 4) POBLAR en df_concat SOLO donde estaba vacío
+    mask_concat_vacio = df_concat["CONTENIDO"].isna() | (df_concat["CONTENIDO"].str.strip() == "")
+    
+    df_concat.loc[mask_concat_vacio, "CONTENIDO"] = df_concat.loc[mask_concat_vacio, "guia"].map(map_contenido)
+        
+ 
+    
 
     st.success(f"Manifiestos asignados. Nuevo 11591={nuevo_man_11591} | Otros={nuevo_man_otros}")
 
@@ -304,9 +551,10 @@ if run:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_concat.to_excel(writer, sheet_name="HISTORICO", index=False)
+        df_costos_manifiesto.to_excel(writer, sheet_name="costo por manifiesto", index=False)
     output.seek(0)
     excel_bytes = output.getvalue()
-
+    
     dbx.files_upload(excel_bytes, DBX_FILE_PATH, mode=dropbox.files.WriteMode.overwrite)
 
     st.success("Histórico actualizado en Dropbox (reemplazado) ✅")
@@ -383,13 +631,40 @@ else:
             .tolist()
         )
 
-        def df_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "DATA") -> bytes:
+        def dfs_to_excel_bytes(sheets: dict) -> bytes:
+            """
+            sheets: dict {nombre_hoja: dataframe}
+            """
             out = io.BytesIO()
             with pd.ExcelWriter(out, engine="openpyxl") as writer:
-                df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+                for name, df in sheets.items():
+                    safe_name = str(name)[:31]  # límite de Excel
+                    df.to_excel(writer, sheet_name=safe_name, index=False)
             out.seek(0)
             return out.getvalue()
-
+        
+        
+        def resumen_costo_por_manifiesto(df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Suma PESO LIBRAS, PESO KILOS, PIEZAS, COSTO por MANIFIESTO (solo para el df recibido).
+            """
+            df2 = df.copy()
+        
+            for col in ["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]:
+                if col in df2.columns:
+                    df2[col] = pd.to_numeric(df2[col], errors="coerce")
+        
+            if "MANIFIESTO" not in df2.columns:
+                return pd.DataFrame(columns=["MANIFIESTO", "PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"])
+        
+            out = (
+                df2
+                .groupby("MANIFIESTO", as_index=False)[["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]]
+                .sum(min_count=1)
+            )
+            return out
+        
+        
         def build_zip_all_manifiestos(df_all: pd.DataFrame) -> bytes:
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -397,14 +672,23 @@ else:
                     df_all["MANIFIESTO"].dropna().astype("int64").sort_values().unique().tolist()
                 ):
                     df_m = df_all[df_all["MANIFIESTO"].astype("Int64") == man].copy()
-                    excel_bytes = df_to_excel_bytes(df_m, sheet_name=f"MAN_{man}")
+        
+                    df_costos_m = resumen_costo_por_manifiesto(df_m)
+        
+                    excel_bytes = dfs_to_excel_bytes({
+                        f"MAN_{man}": df_m,
+                        "costo por manifiesto": df_costos_m
+                    })
+        
                     filename = f"{fecha_str}-{man}.xlsx"
                     zf.writestr(filename, excel_bytes)
+        
             zip_buf.seek(0)
             return zip_buf.getvalue()
-
+        
+        
         col_all, col_one = st.columns([1, 1])
-
+        
         with col_all:
             st.markdown("**Descargar todos (ZIP)**")
             if st.button("Preparar ZIP con todos los manifiestos"):
@@ -415,17 +699,22 @@ else:
                     file_name=f"{fecha_str}-manifiestos.zip",
                     mime="application/zip",
                 )
-
+        
         with col_one:
             st.markdown("**Descargar uno puntual**")
             if not manifiestos:
                 st.info("No hay manifiestos disponibles para descargar.")
             else:
                 man_sel = st.selectbox("Buscar/seleccionar manifiesto", options=manifiestos)
-
+        
                 df_sel = df_dl[df_dl["MANIFIESTO"].astype("Int64") == int(man_sel)].copy()
-                excel_sel = df_to_excel_bytes(df_sel, sheet_name=f"MAN_{man_sel}")
-
+                df_costos_sel = resumen_costo_por_manifiesto(df_sel)
+        
+                excel_sel = dfs_to_excel_bytes({
+                    f"MAN_{man_sel}": df_sel,
+                    "costo por manifiesto": df_costos_sel
+                })
+        
                 st.download_button(
                     f"Descargar {fecha_str}-{man_sel}.xlsx",
                     data=excel_sel,
