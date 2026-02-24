@@ -17,6 +17,8 @@ import streamlit as st
 import numpy as np
 import json
 from openai import OpenAI
+import random
+from faker import Faker
 
 st.set_page_config(page_title="Manifiestos Astrid", layout="wide")
 
@@ -154,11 +156,11 @@ if run:
     # 4) Renombres remitente
     # -----------------------------
     rename_map = {
-        "CLIENTE": "COMPAÑÍA REMITENTE",
-        "DIRECCIÓN DESTINO": "REMITENTE DIRECCION",
-        "TELÉFONO": "REMITENTE TELEFONO",
-        "CIUDAD DESTINO": "REMITENTE CIUDAD",
-        "DEPARTAMENTO DESTINO": "REMITENTE ESTADO",
+        "CLIENTE": "NOMBRE DESTINO",
+        "DIRECCIÓN DESTINO": "DESTINO DIRECCION",
+        "TELÉFONO": "DESTINO TELEFONO",
+        "CIUDAD DESTINO": "DESTINO CIUDAD",
+        "DEPARTAMENTO DESTINO": "DESTINO ESTADO",
     }
 
     faltantes = [c for c in rename_map.keys() if c not in df_b.columns]
@@ -169,13 +171,26 @@ if run:
     df_b = df_b.rename(columns=rename_map)
 
     # -----------------------------
-    # 5) Duplicados destino + destino estado
-    # -----------------------------
-    df_b["NOMBRE DESTINO"] = df_b["COMPAÑÍA REMITENTE"]
-    df_b["DESTINO DIRECCION"] = df_b["REMITENTE DIRECCION"]
-    df_b["DESTINO TELEFONO"] = df_b["REMITENTE TELEFONO"]
-    df_b["DESTINO CIUDAD"] = df_b["REMITENTE CIUDAD"]
-    df_b["DESTINO ESTADO"] = df_b["REMITENTE ESTADO"]
+
+
+    
+    fake = Faker("en_US")
+    Faker.seed(42)
+    
+    MIAMI_ZIPS = ["33101","33125","33126","33127","33128","33129","33130","33131","33132","33133","33134","33135","33136","33137","33138","33139"]
+    MIAMI_AREAS = ["305", "786"]
+    
+    n = len(df_b)
+    
+    df_b["COMPAÑÍA REMITENTE"] = [fake.company() for _ in range(n)]
+    df_b["REMITENTE DIRECCION"] = [f"{fake.street_address()}, Miami, FL {fake.random.choice(MIAMI_ZIPS)}" for _ in range(n)]
+    df_b["REMITENTE TELEFONO"] = [f"+1 {random.choice(MIAMI_AREAS)}-{random.randint(200,999)}-{random.randint(1000,9999)}" for _ in range(n)]
+    df_b["REMITENTE CIUDAD"] = "Miami"
+    df_b["REMITENTE ESTADO"] = "FL"
+
+    
+    
+
 
     # -----------------------------
     # 6) Renombrar llaves a guia
