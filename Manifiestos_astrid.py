@@ -156,7 +156,7 @@ if run:
     # 4) Renombres remitente
     # -----------------------------
     rename_map = {
-        "CLIENTE": "NOMBRE DESTINO",
+        "CLIENTE DESTINO": "NOMBRE DESTINO",
         "DIRECCIÓN DESTINO": "DESTINO DIRECCION",
         "TELÉFONO": "DESTINO TELEFONO",
         "CIUDAD DESTINO": "DESTINO CIUDAD",
@@ -174,17 +174,10 @@ if run:
 
 
     
-    fake = Faker("en_US")
-    Faker.seed(42)
-    
-    MIAMI_ZIPS = ["33101","33125","33126","33127","33128","33129","33130","33131","33132","33133","33134","33135","33136","33137","33138","33139"]
-    MIAMI_AREAS = ["305", "786"]
-    
-    n = len(df_b)
-    
-    df_b["COMPAÑÍA REMITENTE"] = [fake.company() for _ in range(n)]
-    df_b["REMITENTE DIRECCION"] = [f"{fake.street_address()}, Miami, FL {fake.random.choice(MIAMI_ZIPS)}" for _ in range(n)]
-    df_b["REMITENTE TELEFONO"] = [f"+1 {random.choice(MIAMI_AREAS)}-{random.randint(200,999)}-{random.randint(1000,9999)}" for _ in range(n)]
+
+    df_b["COMPAÑÍA REMITENTE"] =  "Largo Easy Corp"
+    df_b["REMITENTE DIRECCION"] = "11860 SW 144th Ct Ste 2"
+    df_b["REMITENTE TELEFONO"] = "3053996614"
     df_b["REMITENTE CIUDAD"] = "Miami"
     df_b["REMITENTE ESTADO"] = "FL"
 
