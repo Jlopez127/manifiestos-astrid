@@ -320,13 +320,11 @@ if run:
         w.isna() | (w <= 0),
         0,
         np.where(
-            w <= 1,
-            7.35,
-            7.35 + (w - 1) * 2.6
+            w == 1,
+            7.25,
+            7.25 + (w - 1) * 2.6
         ) + np.where(w >= 20, 4.75, 0)
     ).round(2)
-    
-    
     
     # -----------------------------
     # X) Resumen COSTO por manifiesto (para hoja 2)
