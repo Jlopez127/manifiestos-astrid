@@ -118,7 +118,7 @@ if run:
             "REMITENTE CIUDAD", "REMITENTE ESTADO", "NOMBRE DESTINO", "DESTINO DIRECCION",
             "DESTINO TELEFONO", "DESTINO CIUDAD", "CONTENIDO", "PESO LIBRAS", "PESO KILOS",
             "VALOR DECLARADO", "PIEZAS", "DESTINO ESTADO", "POSICION ARANCELARIA", "MANIFIESTO","INSTRUCCIONES",
-            "CASILLERO"  # útil para lógica de manifiesto
+            "CASILLERO", "VALOR"  # útil para lógica de manifiesto
         ]
         try:
             _, res = dbx.files_download(path)
@@ -202,6 +202,7 @@ if run:
     cols_b = [
         "guia",
         "CASILLERO",
+        "VALOR",
         "COMPAÑÍA REMITENTE",
         "REMITENTE DIRECCION",
         "REMITENTE TELEFONO",
@@ -241,6 +242,54 @@ if run:
 
     hoy_miami = datetime.now(ZoneInfo("America/New_York")).date()
     df_final["FECHA GUIA"] = pd.to_datetime(hoy_miami)
+
+
+    # -----------------------------
+    # 9.1) COSTO en filas nuevas (para validar antes de subir)
+    # -----------------------------
+    w_new = df_final["PESO LIBRAS"]
+    
+    df_final["COSTO"] = np.where(
+        w_new.isna() | (w_new <= 0),
+        0,
+        np.where(
+            w_new == 1,
+            7.25,
+            7.25 + (w_new - 1) * 2.6
+        ) + np.where(w_new >= 20, 4.75, 0)
+    ).round(2)
+    
+    
+    
+    # -----------------------------
+    # 9.2) VALIDACIÓN BLOQUEANTE
+    # Si una guía nueva no encontró peso/costo, se detiene el proceso
+    # -----------------------------
+    mask_error_nuevos = (
+        df_final["PESO LIBRAS"].isna()
+        | (df_final["PESO LIBRAS"] <= 0)
+        | (df_final["COSTO"] == 0)
+    )
+    
+    df_errores_nuevos = df_final.loc[mask_error_nuevos, ["guia", "PESO LIBRAS", "COSTO"]].copy()
+    
+    if not df_errores_nuevos.empty:
+        st.error("❌ Proceso detenido. Hay guías nuevas pistoleadas que no fueron encontradas correctamente en Envíos Encargomio.")
+        
+        st.warning(
+            "Revisa las siguientes guías pistoleadas. "
+            
+        )
+        
+        st.dataframe(df_errores_nuevos, use_container_width=True)
+        
+        guias_error = df_errores_nuevos["guia"].dropna().astype(str).tolist()
+        st.markdown("**Guías con problema:**")
+        st.write(", ".join(guias_error))
+        
+        st.stop()
+
+
 
     # -----------------------------
     # 10) Concat + dedup (histórico manda)
@@ -303,7 +352,8 @@ if run:
         "POSICION ARANCELARIA",
         "MANIFIESTO",
         "INSTRUCCIONES",
-        "CASILLERO"
+        "CASILLERO",
+        "VALOR"
     ]
     
     # solo deja las que existan (por si el histórico viejo trae extras)
@@ -592,7 +642,7 @@ else:
     # - renombra guia -> GUIA
     # -----------------------------
     df_dl = df_concat.copy()
-    df_dl = df_dl.drop(columns=["CASILLERO"], errors="ignore")
+    df_dl = df_dl.drop(columns=["CASILLERO","VALOR"], errors="ignore")
 
     if "guia" in df_dl.columns:
         df_dl = df_dl.rename(columns={"guia": "GUIA"})
