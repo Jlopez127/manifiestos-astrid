@@ -262,30 +262,45 @@ if run:
     
     
     # -----------------------------
+# -----------------------------
     # 9.2) VALIDACIÓN BLOQUEANTE
     # Si una guía nueva no encontró peso/costo, se detiene el proceso
+    # EXCEPTO guías permitidas
     # -----------------------------
+    
+    GUIAS_EXCLUIDAS_ALERTA = {"85674", "8646"}
+    
+    # normalizar guia como texto limpio
+    df_final["guia"] = _clean_str_series(df_final["guia"])
+    
     mask_error_nuevos = (
         df_final["PESO LIBRAS"].isna()
         | (df_final["PESO LIBRAS"] <= 0)
     )
     
-    df_errores_nuevos = df_final.loc[mask_error_nuevos, ["guia", "PESO LIBRAS", "COSTO"]].copy()
+    # excluir solo estas dos guías de la advertencia
+    mask_excluidas = df_final["guia"].isin(GUIAS_EXCLUIDAS_ALERTA)
+    
+    df_errores_nuevos = df_final.loc[
+        mask_error_nuevos & ~mask_excluidas,
+        ["guia", "PESO LIBRAS", "COSTO"]
+    ].copy()
     
     if not df_errores_nuevos.empty:
         st.error("❌ Proceso detenido. Hay guías nuevas pistoleadas que no fueron encontradas correctamente en Envíos Encargomio.")
-        
+    
         st.warning(
             "Revisa las siguientes guías pistoleadas. "
-            
+            "Tienen PESO LIBRAS vacío, menor o igual a 0, o COSTO en 0. "
+            "Por eso el histórico no se cargará."
         )
-        
+    
         st.dataframe(df_errores_nuevos, use_container_width=True)
-        
+    
         guias_error = df_errores_nuevos["guia"].dropna().astype(str).tolist()
         st.markdown("**Guías con problema:**")
         st.write(", ".join(guias_error))
-        
+    
         st.stop()
 
 
