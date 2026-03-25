@@ -268,7 +268,6 @@ if run:
     mask_error_nuevos = (
         df_final["PESO LIBRAS"].isna()
         | (df_final["PESO LIBRAS"] <= 0)
-        | (df_final["COSTO"] == 0)
     )
     
     df_errores_nuevos = df_final.loc[mask_error_nuevos, ["guia", "PESO LIBRAS", "COSTO"]].copy()
