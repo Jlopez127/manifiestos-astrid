@@ -268,7 +268,7 @@ if run:
     # EXCEPTO guías permitidas
     # -----------------------------
     
-    GUIAS_EXCLUIDAS_ALERTA = {"85674", "8646","82760","83685"}
+    GUIAS_EXCLUIDAS_ALERTA = {"85674", "8646","82760","83685","84147"}
     
     # normalizar guia como texto limpio
     df_final["guia"] = _clean_str_series(df_final["guia"])
