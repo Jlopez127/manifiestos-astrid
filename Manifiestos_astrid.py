@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Created on Thu Feb 19 20:28:41 2026
 
@@ -16,6 +16,8 @@ import dropbox
 import streamlit as st
 import numpy as np
 import json
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 from openai import OpenAI
 import random
 from faker import Faker
@@ -88,6 +90,155 @@ def _norm_casillero(x) -> str:
     return f"CA{digits}" if digits else s
 
 
+def _clean_optional_text(x) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
+
+
+def _build_destinatario_real(nombre: str, direccion: str, telefono: str, ciudad: str, estado: str) -> dict:
+    return {
+        "NOMBRE DESTINO": _clean_optional_text(nombre),
+        "DESTINO DIRECCION": _clean_optional_text(direccion),
+        "DESTINO TELEFONO": _clean_optional_text(telefono),
+        "DESTINO CIUDAD": _clean_optional_text(ciudad),
+        "DESTINO ESTADO": _clean_optional_text(estado),
+    }
+
+
+def _build_destinatario_fake(fake: Faker) -> dict:
+    ciudades_departamentos = [
+        ("Medellín", "Antioquia"),
+        ("Envigado", "Antioquia"),
+        ("Rionegro", "Antioquia"),
+        ("Cali", "Valle del Cauca"),
+        ("Palmira", "Valle del Cauca"),
+        ("Barranquilla", "Atlántico"),
+        ("Bucaramanga", "Santander"),
+        ("Floridablanca", "Santander"),
+        ("Cartagena", "Bolívar"),
+        ("Pereira", "Risaralda"),
+        ("Manizales", "Caldas"),
+        ("Armenia", "Quindío"),
+        ("Ibagué", "Tolima"),
+        ("Santa Marta", "Magdalena"),
+        ("Montería", "Córdoba"),
+        ("Neiva", "Huila"),
+        ("Pasto", "Nariño"),
+        ("Cúcuta", "Norte de Santander"),
+        ("Soacha", "Cundinamarca"),
+        ("Villavicencio", "Meta"),
+    ]
+    tipos_via = ["Calle", "Carrera", "Diagonal", "Transversal", "Avenida"]
+
+    ciudad, departamento = random.choice(ciudades_departamentos)
+    tipo_via = random.choice(tipos_via)
+    numero_1 = random.randint(1, 120)
+    numero_2 = random.randint(1, 99)
+    numero_3 = random.randint(1, 99)
+    telefono = "3" + "".join(random.choices("0123456789", k=9))
+    direccion = f"{tipo_via} {numero_1} # {numero_2}-{numero_3}"
+
+    return {
+        "NOMBRE DESTINO": fake.name(),
+        "DESTINO DIRECCION": direccion,
+        "DESTINO TELEFONO": telefono,
+        "DESTINO CIUDAD": ciudad,
+        "DESTINO ESTADO": departamento,
+    }
+
+
+def apply_contingencia_destinatario(df: pd.DataFrame, casillero_objetivo: str, destinatario_real: dict) -> tuple[pd.DataFrame, int]:
+    df = df.copy()
+    df["_ES_CONTINGENCIA"] = False
+    df["CONTINGENCIA_REAL"] = False
+
+    casillero_norm = _norm_casillero(casillero_objetivo)
+    mask_casillero = df["CASILLERO"].apply(_norm_casillero) == casillero_norm
+    idx_objetivo = df.index[mask_casillero].tolist()
+
+    if not idx_objetivo:
+        return df, 0
+
+    df.loc[idx_objetivo, "_ES_CONTINGENCIA"] = True
+
+    idx_primero = idx_objetivo[0]
+    df.at[idx_primero, "CONTINGENCIA_REAL"] = True
+    for col, value in destinatario_real.items():
+        df.at[idx_primero, col] = value
+
+    fake = Faker("es_CO")
+    for idx in idx_objetivo[1:]:
+        destinatario_fake = _build_destinatario_fake(fake)
+        for col, value in destinatario_fake.items():
+            df.at[idx, col] = value
+
+    return df, len(idx_objetivo)
+
+
+def _normalize_excel_key(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip().removesuffix(".0")
+
+
+def _paint_rows_red_by_guia(ws, guia_col_name: str, guias_rojas: set[str]) -> None:
+    if not guias_rojas or ws.max_row < 2:
+        return
+
+    header_map = {cell.value: cell.column for cell in ws[1] if cell.value is not None}
+    guia_col_idx = header_map.get(guia_col_name)
+    if guia_col_idx is None:
+        return
+
+    red_fill = PatternFill(fill_type="solid", fgColor="FF4D4F")
+    white_font = Font(color="FFFFFF", bold=True)
+
+    for row_idx in range(2, ws.max_row + 1):
+        guia_value = _normalize_excel_key(ws.cell(row=row_idx, column=guia_col_idx).value)
+        if guia_value not in guias_rojas:
+            continue
+        for col_idx in range(1, ws.max_column + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.fill = red_fill
+            cell.font = white_font
+
+
+def _hide_excel_columns(ws, column_names: list[str]) -> None:
+    if not column_names or ws.max_row < 1:
+        return
+
+    header_map = {cell.value: cell.column for cell in ws[1] if cell.value is not None}
+    for column_name in column_names:
+        col_idx = header_map.get(column_name)
+        if col_idx is not None:
+            ws.column_dimensions[get_column_letter(col_idx)].hidden = True
+
+
+def dfs_to_excel_bytes(
+    sheets: dict,
+    highlight_rows: dict | None = None,
+    hidden_columns: dict | None = None,
+) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            safe_name = str(name)[:31]
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+
+            ws = writer.sheets[safe_name]
+            config_highlight = (highlight_rows or {}).get(safe_name)
+            if config_highlight:
+                _paint_rows_red_by_guia(ws, config_highlight["guia_col"], config_highlight["guias"])
+
+            cols_to_hide = (hidden_columns or {}).get(safe_name, [])
+            if cols_to_hide:
+                _hide_excel_columns(ws, cols_to_hide)
+
+    out.seek(0)
+    return out.getvalue()
+
+
 # -----------------------------
 # UI: Uploaders
 # -----------------------------
@@ -101,10 +252,52 @@ with col2:
 with col3:
     up_p = st.file_uploader("Sube Productos por casillero", type=["xlsx", "xls"])
 
+st.markdown("### Contingencia")
+contingencia_activa = st.toggle(
+    "Activar contingencia para un casillero puntual",
+    value=False,
+    help="Deja el primer registro nuevo del casillero con destinatario real y simula los siguientes.",
+)
+
+cont_casillero = ""
+cont_nombre = ""
+cont_direccion = ""
+cont_telefono = ""
+cont_ciudad = ""
+cont_estado = ""
+contingencia_lista = True
+
+if contingencia_activa:
+    st.info("La contingencia solo afecta guías nuevas del casillero indicado en esta corrida.")
+
+    cont_col1, cont_col2, cont_col3 = st.columns(3)
+    with cont_col1:
+        cont_casillero = st.text_input("Casillero de contingencia")
+        cont_nombre = st.text_input("Nombre destinatario real")
+    with cont_col2:
+        cont_direccion = st.text_input("Dirección destinatario real")
+        cont_telefono = st.text_input("Teléfono destinatario real")
+    with cont_col3:
+        cont_ciudad = st.text_input("Ciudad destinatario real")
+        cont_estado = st.text_input("Estado destinatario real")
+
+    campos_contingencia = [
+        cont_casillero,
+        cont_nombre,
+        cont_direccion,
+        cont_telefono,
+        cont_ciudad,
+        cont_estado,
+    ]
+    contingencia_lista = all(_clean_optional_text(v) for v in campos_contingencia)
+
+    if not contingencia_lista:
+        st.warning("Completa casillero y todos los datos reales del destinatario para usar la contingencia.")
+
 run = st.button(
     "Procesar y actualizar histórico en Dropbox",
     type="primary",
-    disabled=not (up_a and up_b and up_p)
+    disabled=not (up_a and up_b and up_p and contingencia_lista)
 )
 if run:
     # -----------------------------
@@ -157,11 +350,19 @@ if run:
     # -----------------------------
     rename_map = {
         "CLIENTE DESTINO": "NOMBRE DESTINO",
-        "DIRECCIÓN DESTINO": "DESTINO DIRECCION",
-        "TELÉFONO": "DESTINO TELEFONO",
         "CIUDAD DESTINO": "DESTINO CIUDAD",
         "DEPARTAMENTO DESTINO": "DESTINO ESTADO",
     }
+    alias_cols = {
+        "DIRECCIÓN DESTINO": "DESTINO DIRECCION",
+        "DIRECCIÃ“N DESTINO": "DESTINO DIRECCION",
+        "TELÉFONO": "DESTINO TELEFONO",
+        "TELÃ‰FONO": "DESTINO TELEFONO",
+    }
+
+    for src, dst in alias_cols.items():
+        if src in df_b.columns:
+            df_b = df_b.rename(columns={src: dst})
 
     faltantes = [c for c in rename_map.keys() if c not in df_b.columns]
     if faltantes:
@@ -169,6 +370,11 @@ if run:
         st.stop()
 
     df_b = df_b.rename(columns=rename_map)
+
+    faltantes_alias = [c for c in ["DESTINO DIRECCION", "DESTINO TELEFONO"] if c not in df_b.columns]
+    if faltantes_alias:
+        st.error(f"Faltan columnas en B: {faltantes_alias}")
+        st.stop()
 
     # -----------------------------
 
@@ -226,6 +432,33 @@ if run:
     # 8) Merge
     # -----------------------------
     df_final = df_a.merge(df_b_sel, how="left", on="guia")
+    df_final["_ES_CONTINGENCIA"] = False
+    df_final["CONTINGENCIA_REAL"] = False
+
+    if contingencia_activa:
+        destinatario_real = _build_destinatario_real(
+            cont_nombre,
+            cont_direccion,
+            cont_telefono,
+            cont_ciudad,
+            cont_estado,
+        )
+        df_final, total_contingencia = apply_contingencia_destinatario(
+            df_final,
+            cont_casillero,
+            destinatario_real,
+        )
+
+        if total_contingencia == 0:
+            st.warning(
+                f"Contingencia activa, pero no se encontraron guías nuevas para el casillero {_norm_casillero(cont_casillero)}."
+            )
+        else:
+            simuladas = max(total_contingencia - 1, 0)
+            st.info(
+                f"Contingencia aplicada a {total_contingencia} guía(s) nuevas de {_norm_casillero(cont_casillero)}: 1 real y {simuladas} simulada(s)."
+            )
+
     # -----------------------------
 # 8.1) Columnas nuevas
 # -----------------------------
@@ -268,7 +501,7 @@ if run:
     # EXCEPTO guías permitidas
     # -----------------------------
     
-    GUIAS_EXCLUIDAS_ALERTA = {"85674", "8646","82760","83685","84147"}
+    GUIAS_EXCLUIDAS_ALERTA = {"85674", "8646","82760","83685","84147","84243"}
     
     # normalizar guia como texto limpio
     df_final["guia"] = _clean_str_series(df_final["guia"])
@@ -310,6 +543,12 @@ if run:
     # -----------------------------
     df_historico["guia"] = _clean_str_series(df_historico["guia"])
     df_final["guia"] = _clean_str_series(df_final["guia"])
+    df_historico["_ES_CONTINGENCIA"] = False
+    df_final["_ES_CONTINGENCIA"] = df_final["_ES_CONTINGENCIA"].fillna(False)
+    if "CONTINGENCIA_REAL" not in df_historico.columns:
+        df_historico["CONTINGENCIA_REAL"] = False
+    df_historico["CONTINGENCIA_REAL"] = df_historico["CONTINGENCIA_REAL"].fillna(False)
+    df_final["CONTINGENCIA_REAL"] = df_final["CONTINGENCIA_REAL"].fillna(False)
 
     df_concat = pd.concat([df_historico, df_final], ignore_index=True)
     df_concat = df_concat.drop_duplicates(subset=["guia"], keep="first").reset_index(drop=True)
@@ -320,28 +559,43 @@ if run:
     if "MANIFIESTO" not in df_concat.columns:
         df_concat["MANIFIESTO"] = pd.NA
 
+    if "_ES_CONTINGENCIA" not in df_concat.columns:
+        df_concat["_ES_CONTINGENCIA"] = False
+
+    df_concat["_ES_CONTINGENCIA"] = df_concat["_ES_CONTINGENCIA"].fillna(False).astype(bool)
     df_concat["CASILLERO_NORM"] = df_concat["CASILLERO"].apply(_norm_casillero)
     df_concat["MANIFIESTO_NUM"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce")
 
     mask_vacio = df_concat["MANIFIESTO_NUM"].isna()
+    mask_contingencia = df_concat["_ES_CONTINGENCIA"]
     mask_11591 = df_concat["CASILLERO_NORM"] == "CA11591"
+    man_num_str = df_concat["MANIFIESTO_NUM"].astype("Int64").astype("string")
 
-    max_11591 = df_concat.loc[~mask_vacio & mask_11591, "MANIFIESTO_NUM"].max()
-    max_otros = df_concat.loc[~mask_vacio & ~mask_11591, "MANIFIESTO_NUM"].max()
+    max_11591 = df_concat.loc[~mask_vacio & mask_11591 & ~mask_contingencia, "MANIFIESTO_NUM"].max()
+    max_otros = df_concat.loc[~mask_vacio & ~mask_11591 & ~mask_contingencia, "MANIFIESTO_NUM"].max()
+    max_contingencia = df_concat.loc[
+        df_concat["MANIFIESTO_NUM"].notna() & man_num_str.str.startswith("4").fillna(False),
+        "MANIFIESTO_NUM"
+    ].max()
 
     if pd.isna(max_11591):
         max_11591 = 900000
     if pd.isna(max_otros):
         max_otros = 100000
+    if pd.isna(max_contingencia):
+        max_contingencia = 400000
 
     nuevo_man_11591 = int(max_11591) + 1
     nuevo_man_otros = int(max_otros) + 1
+    nuevo_man_contingencia = int(max_contingencia) + 1 if mask_contingencia.any() else None
 
-    df_concat.loc[mask_vacio & mask_11591, "MANIFIESTO"] = nuevo_man_11591
-    df_concat.loc[mask_vacio & ~mask_11591, "MANIFIESTO"] = nuevo_man_otros
+    if nuevo_man_contingencia is not None:
+        df_concat.loc[mask_vacio & mask_contingencia, "MANIFIESTO"] = nuevo_man_contingencia
+    df_concat.loc[mask_vacio & mask_11591 & ~mask_contingencia, "MANIFIESTO"] = nuevo_man_11591
+    df_concat.loc[mask_vacio & ~mask_11591 & ~mask_contingencia, "MANIFIESTO"] = nuevo_man_otros
 
     df_concat["MANIFIESTO"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce").astype("Int64")
-    df_concat = df_concat.drop(columns=["CASILLERO_NORM", "MANIFIESTO_NUM"], errors="ignore")
+    df_concat = df_concat.drop(columns=["CASILLERO_NORM", "MANIFIESTO_NUM", "_ES_CONTINGENCIA"], errors="ignore")
     # -----------------------------
     # 11.5) Reordenar columnas para export
     # -----------------------------
@@ -613,17 +867,36 @@ if run:
  
     
 
-    st.success(f"Manifiestos asignados. Nuevo 11591={nuevo_man_11591} | Otros={nuevo_man_otros}")
+    resumen_manifiestos = [
+        f"Nuevo 11591={nuevo_man_11591}",
+        f"Otros={nuevo_man_otros}",
+    ]
+    if nuevo_man_contingencia is not None:
+        resumen_manifiestos.insert(0, f"Contingencia={nuevo_man_contingencia}")
+
+    st.success(f"Manifiestos asignados. {' | '.join(resumen_manifiestos)}")
 
     # -----------------------------
     # 12) Subir histórico actualizado (overwrite) a Dropbox
     # -----------------------------
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_concat.to_excel(writer, sheet_name="HISTORICO", index=False)
-        df_costos_manifiesto.to_excel(writer, sheet_name="costo por manifiesto", index=False)
-    output.seek(0)
-    excel_bytes = output.getvalue()
+    guias_contingencia_reales = {
+        _normalize_excel_key(guia)
+        for guia in df_concat.loc[df_concat["CONTINGENCIA_REAL"].fillna(False), "guia"].tolist()
+        if _normalize_excel_key(guia)
+    }
+
+    excel_bytes = dfs_to_excel_bytes(
+        {
+            "HISTORICO": df_concat,
+            "costo por manifiesto": df_costos_manifiesto,
+        },
+        highlight_rows={
+            "HISTORICO": {"guia_col": "guia", "guias": guias_contingencia_reales},
+        },
+        hidden_columns={
+            "HISTORICO": ["CONTINGENCIA_REAL"],
+        },
+    )
     
     dbx.files_upload(excel_bytes, DBX_FILE_PATH, mode=dropbox.files.WriteMode.overwrite)
 
@@ -631,7 +904,7 @@ if run:
 
     # (opcional) mostrar muestra
     with st.expander("Ver muestra del histórico resultante"):
-        st.dataframe(df_concat.head(100))
+        st.dataframe(df_concat.drop(columns=["CONTINGENCIA_REAL"], errors="ignore").head(100))
     st.session_state["df_concat"] = df_concat
     st.session_state["fecha_str"] = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
         
@@ -655,8 +928,14 @@ else:
     # - ordena columnas
     # - renombra guia -> GUIA
     # -----------------------------
+    guias_contingencia_reales = {
+        _normalize_excel_key(guia)
+        for guia in df_concat.loc[df_concat["CONTINGENCIA_REAL"].fillna(False), "guia"].tolist()
+        if _normalize_excel_key(guia)
+    }
+
     df_dl = df_concat.copy()
-    df_dl = df_dl.drop(columns=["CASILLERO","VALOR"], errors="ignore")
+    df_dl = df_dl.drop(columns=["CASILLERO","VALOR","CONTINGENCIA_REAL"], errors="ignore")
 
     if "guia" in df_dl.columns:
         df_dl = df_dl.rename(columns={"guia": "GUIA"})
@@ -701,19 +980,7 @@ else:
             .tolist()
         )
 
-        def dfs_to_excel_bytes(sheets: dict) -> bytes:
-            """
-            sheets: dict {nombre_hoja: dataframe}
-            """
-            out = io.BytesIO()
-            with pd.ExcelWriter(out, engine="openpyxl") as writer:
-                for name, df in sheets.items():
-                    safe_name = str(name)[:31]  # límite de Excel
-                    df.to_excel(writer, sheet_name=safe_name, index=False)
-            out.seek(0)
-            return out.getvalue()
-        
-        
+
         def resumen_costo_por_manifiesto(df: pd.DataFrame) -> pd.DataFrame:
             """
             Suma PESO LIBRAS, PESO KILOS, PIEZAS, COSTO por MANIFIESTO (solo para el df recibido).
@@ -745,10 +1012,21 @@ else:
         
                     df_costos_m = resumen_costo_por_manifiesto(df_m)
         
-                    excel_bytes = dfs_to_excel_bytes({
-                        f"MAN_{man}": df_m,
-                        "costo por manifiesto": df_costos_m
-                    })
+                    guias_rojas_man = {
+                        _normalize_excel_key(guia)
+                        for guia in df_m.get("GUIA", pd.Series(dtype="string")).tolist()
+                        if _normalize_excel_key(guia) in guias_contingencia_reales
+                    }
+
+                    excel_bytes = dfs_to_excel_bytes(
+                        {
+                            f"MAN_{man}": df_m,
+                            "costo por manifiesto": df_costos_m,
+                        },
+                        highlight_rows={
+                            f"MAN_{man}": {"guia_col": "GUIA", "guias": guias_rojas_man},
+                        },
+                    )
         
                     filename = f"{fecha_str}-{man}.xlsx"
                     zf.writestr(filename, excel_bytes)
@@ -780,10 +1058,21 @@ else:
                 df_sel = df_dl[df_dl["MANIFIESTO"].astype("Int64") == int(man_sel)].copy()
                 df_costos_sel = resumen_costo_por_manifiesto(df_sel)
         
-                excel_sel = dfs_to_excel_bytes({
-                    f"MAN_{man_sel}": df_sel,
-                    "costo por manifiesto": df_costos_sel
-                })
+                guias_rojas_sel = {
+                    _normalize_excel_key(guia)
+                    for guia in df_sel.get("GUIA", pd.Series(dtype="string")).tolist()
+                    if _normalize_excel_key(guia) in guias_contingencia_reales
+                }
+
+                excel_sel = dfs_to_excel_bytes(
+                    {
+                        f"MAN_{man_sel}": df_sel,
+                        "costo por manifiesto": df_costos_sel,
+                    },
+                    highlight_rows={
+                        f"MAN_{man_sel}": {"guia_col": "GUIA", "guias": guias_rojas_sel},
+                    },
+                )
         
                 st.download_button(
                     f"Descargar {fecha_str}-{man_sel}.xlsx",
