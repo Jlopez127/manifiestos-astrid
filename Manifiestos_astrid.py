@@ -443,11 +443,21 @@ if run:
             cont_ciudad,
             cont_estado,
         )
-        df_final, total_contingencia = apply_contingencia_destinatario(
-            df_final,
+
+        # Aplicar contingencia solo sobre guías que no están en el histórico
+        guias_en_historico = set(_clean_str_series(df_historico["guia"]).dropna())
+        mask_nuevas = ~df_final["guia"].isin(guias_en_historico)
+
+        df_nuevas = df_final[mask_nuevas].copy()
+        df_viejas = df_final[~mask_nuevas].copy()
+
+        df_nuevas, total_contingencia = apply_contingencia_destinatario(
+            df_nuevas,
             cont_casillero,
             destinatario_real,
         )
+
+        df_final = pd.concat([df_viejas, df_nuevas], ignore_index=True)
 
         if total_contingencia == 0:
             st.warning(
