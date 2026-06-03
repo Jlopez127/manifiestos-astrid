@@ -1276,10 +1276,23 @@ elif modo == "Celulares Fénix":
         else:
             lote_actual = 1
 
-        # Sellar SOLO las guías nuevas (df_salida_fx); las del histórico ya traen su sello
+        # Sellar SOLO las guías nuevas (df_salida_fx); las del histórico ya traen su sello.
+        # OJO: el datetime debe quedar tz-naive (Excel/openpyxl no soporta tz),
+        # conservando la hora local de Miami.
         now_miami = datetime.now(ZoneInfo("America/New_York"))
-        df_salida_fx["FECHA_PROCESO"] = pd.to_datetime(now_miami.replace(microsecond=0))
+        fecha_proceso_naive = now_miami.replace(microsecond=0, tzinfo=None)
+        df_salida_fx["FECHA_PROCESO"] = pd.to_datetime(fecha_proceso_naive)
         df_salida_fx["LOTE"] = lote_actual
+
+        # Salvaguarda: si algún histórico viejo trae FECHA_PROCESO tz-aware,
+        # la pasamos a tz-naive justo antes de escribir Excel (openpyxl no soporta tz).
+        def _strip_tz(df):
+            if "FECHA_PROCESO" in df.columns:
+                s = pd.to_datetime(df["FECHA_PROCESO"], errors="coerce")
+                if getattr(s.dt, "tz", None) is not None:
+                    df = df.copy()
+                    df["FECHA_PROCESO"] = s.dt.tz_localize(None)
+            return df
 
         # 7) Resumen agregado
         total_guias_fx = df_salida_fx["guia"].nunique()
@@ -1310,8 +1323,8 @@ elif modo == "Celulares Fénix":
 
         # 9) Descarga Excel (reusa la función global dfs_to_excel_bytes)
         excel_fx = dfs_to_excel_bytes({
-            "CELULARES": df_salida_fx,
-            "RESUMEN": guias_por_ciudad_fx,
+            "CELULARES": _strip_tz(df_salida_fx),
+            "RESUMEN": _strip_tz(guias_por_ciudad_fx),
         })
         st.download_button(
             label="Descargar Excel Celulares Fénix",
@@ -1346,7 +1359,7 @@ elif modo == "Celulares Fénix":
         df_hist_fx = df_hist_fx.drop_duplicates(subset=["guia"], keep="first")
 
         # Generar Excel del histórico con la global
-        excel_hist_fx = dfs_to_excel_bytes({"HISTORICO": df_hist_fx})
+        excel_hist_fx = dfs_to_excel_bytes({"HISTORICO": _strip_tz(df_hist_fx)})
 
         # Subir a Dropbox sobreescribiendo (mismo patrón que Luma), con manejo de error
         try:
@@ -1366,7 +1379,7 @@ elif modo == "Celulares Fénix":
         #     Las guías que ya existían conservaron su lote viejo (keep="first"),
         #     por lo que no aparecen aquí: es exactamente "solo lo nuevo".
         df_lote_actual = df_hist_fx[df_hist_fx["LOTE"] == lote_actual].copy()
-        excel_lote = dfs_to_excel_bytes({"LOTE_ACTUAL": df_lote_actual})
+        excel_lote = dfs_to_excel_bytes({"LOTE_ACTUAL": _strip_tz(df_lote_actual)})
         st.download_button(
             label=f"Descargar solo lo nuevo (lote {lote_actual})",
             data=excel_lote,
