@@ -1242,11 +1242,44 @@ elif modo == "Celulares Fénix":
             "FECHA GUIA", "guia", "NOMBRE DESTINO", "DESTINO DIRECCION",
             "DESTINO TELEFONO", "DESTINO CIUDAD", "DESTINO ESTADO", "CONTENIDO",
             "PRODUCTOS", "PESO LIBRAS", "PESO KILOS", "VALOR DECLARADO", "PIEZAS",
+            "FECHA_PROCESO", "LOTE",
         ]
         for c in cols_salida_fx:
             if c not in df_guia.columns:
                 df_guia[c] = pd.NA
         df_salida_fx = df_guia[cols_salida_fx].copy()
+
+        # 6.1) Cargar histórico Fénix, calcular LOTE y sellar las guías nuevas
+        #      (se hace ANTES de mostrar el detalle para que FECHA_PROCESO y LOTE
+        #       aparezcan en pantalla y en el Excel de descarga completa)
+        DBX_FILE_PATH_FENIX = "/Manifiestos/Celulares_fenix.xlsx"
+
+        def load_historico_fenix(dbx, path):
+            try:
+                _, res = dbx.files_download(path)
+                return pd.read_excel(io.BytesIO(res.content), sheet_name=0)
+            except dropbox.exceptions.ApiError:
+                return pd.DataFrame(columns=df_salida_fx.columns)
+
+        dbx_fx = get_dbx()
+        hist_fx = load_historico_fenix(dbx_fx, DBX_FILE_PATH_FENIX)
+
+        # Normalizar llave "guia" en ambos (por .0 / espacios) con la global
+        if "guia" in hist_fx.columns and not hist_fx.empty:
+            hist_fx["guia"] = _clean_str_series(hist_fx["guia"])
+        df_salida_fx["guia"] = _clean_str_series(df_salida_fx["guia"])
+
+        # Calcular LOTE de esta corrida (después de cargar hist_fx, antes de concatenar)
+        if (not hist_fx.empty) and ("LOTE" in hist_fx.columns):
+            _max_lote_fx = pd.to_numeric(hist_fx["LOTE"], errors="coerce").max()
+            lote_actual = int(_max_lote_fx) + 1 if pd.notna(_max_lote_fx) else 1
+        else:
+            lote_actual = 1
+
+        # Sellar SOLO las guías nuevas (df_salida_fx); las del histórico ya traen su sello
+        now_miami = datetime.now(ZoneInfo("America/New_York"))
+        df_salida_fx["FECHA_PROCESO"] = pd.to_datetime(now_miami.replace(microsecond=0))
+        df_salida_fx["LOTE"] = lote_actual
 
         # 7) Resumen agregado
         total_guias_fx = df_salida_fx["guia"].nunique()
@@ -1298,23 +1331,15 @@ elif modo == "Celulares Fénix":
             "Esta acción SOBREESCRIBE ese archivo de histórico Fénix en Dropbox."
         )
 
-        # Ruta local (no global) del histórico Fénix; NO se toca DBX_FILE_PATH de Luma
-        DBX_FILE_PATH_FENIX = "/Manifiestos/Celulares_fenix.xlsx"
+        # (El histórico Fénix ya se cargó en el paso 6.1; DBX_FILE_PATH_FENIX, hist_fx
+        #  y lote_actual están definidos. df_salida_fx ya viene sellado.)
 
-        def load_historico_fenix(dbx, path):
-            try:
-                _, res = dbx.files_download(path)
-                return pd.read_excel(io.BytesIO(res.content), sheet_name=0)
-            except dropbox.exceptions.ApiError:
-                return pd.DataFrame(columns=df_salida_fx.columns)
-
-        dbx_fx = get_dbx()
-        hist_fx = load_historico_fenix(dbx_fx, DBX_FILE_PATH_FENIX)
-
-        # Normalizar llave "guia" en ambos (por .0 / espacios) con la global
-        if "guia" in hist_fx.columns and not hist_fx.empty:
-            hist_fx["guia"] = _clean_str_series(hist_fx["guia"])
-        df_salida_fx["guia"] = _clean_str_series(df_salida_fx["guia"])
+        # Si el histórico viene de antes de este cambio (sin FECHA_PROCESO / LOTE),
+        # crear esas columnas para que el concat no desalinee
+        if "FECHA_PROCESO" not in hist_fx.columns:
+            hist_fx["FECHA_PROCESO"] = pd.NaT
+        if "LOTE" not in hist_fx.columns:
+            hist_fx["LOTE"] = pd.NA
 
         # Concatenar y deduplicar conservando lo VIEJO (histórico manda)
         df_hist_fx = pd.concat([hist_fx, df_salida_fx], ignore_index=True)
@@ -1336,3 +1361,18 @@ elif modo == "Celulares Fénix":
             )
         except Exception as e:
             st.error(f"No se pudo actualizar el histórico Fénix en Dropbox: {e}")
+
+        # 12) Descargar SOLO el lote de esta corrida (lo realmente nuevo).
+        #     Las guías que ya existían conservaron su lote viejo (keep="first"),
+        #     por lo que no aparecen aquí: es exactamente "solo lo nuevo".
+        df_lote_actual = df_hist_fx[df_hist_fx["LOTE"] == lote_actual].copy()
+        excel_lote = dfs_to_excel_bytes({"LOTE_ACTUAL": df_lote_actual})
+        st.download_button(
+            label=f"Descargar solo lo nuevo (lote {lote_actual})",
+            data=excel_lote,
+            file_name=f"celulares_fenix_lote{lote_actual}_{now_miami.date()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.info(
+            f"Esta corrida agregó {len(df_lote_actual)} guías nuevas (lote {lote_actual})."
+        )
