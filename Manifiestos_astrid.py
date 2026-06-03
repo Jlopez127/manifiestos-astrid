@@ -1162,11 +1162,13 @@ elif modo == "Celulares Fénix":
                 + ", ".join(guias_sin_match_fx)
             )
 
-        # g) CRUCE 2: con P por envío (la guía de Fénix cruza contra "Envío" de P)
+        # g) CRUCE 2: con P por número de envío ("NUMERO ENVIO" de B ↔ "Envío" de P)
+        # La columna "Envío" de Productos es numérica y contiene NUMERO ENVIO, no la guía de Fénix.
+        df_ab["NUMERO ENVIO"] = _clean_str_series(df_ab["NUMERO ENVIO"])
         df_full = df_ab.merge(
             df_p_fx,
             how="left",
-            left_on="Guias fenix",
+            left_on="NUMERO ENVIO",
             right_on="Envío",
         )
 
@@ -1191,6 +1193,7 @@ elif modo == "Celulares Fénix":
             "CLIENTE DESTINO": "NOMBRE DESTINO",
             "CIUDAD DESTINO": "DESTINO CIUDAD",
             "DEPARTAMENTO DESTINO": "DESTINO ESTADO",
+            "PESO": "PESO LIBRAS",
         }
         alias_cols = {
             "DIRECCIÓN DESTINO": "DESTINO DIRECCION",

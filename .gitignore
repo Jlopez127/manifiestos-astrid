@@ -16,3 +16,13 @@ env/
 *.log
 *.tmp
 .DS_Store
+
+# Datos reales de clientes (NO subir)
+*.xlsx
+*.xls
+Guias_fenix.xlsx
+1780493515239Envios_Encargomio.xlsx
+1780495041874Reporte_Casillero.xlsx
+
+# Script de prueba local
+test_fenix.py
