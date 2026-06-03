@@ -244,861 +244,1092 @@ def dfs_to_excel_bytes(
 # -----------------------------
 st.title("Manifiestos Astrid")
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    up_a = st.file_uploader("Sube Pistoleo de bodega (Envios pistoleo)", type=["xlsx", "xls"])
-with col2:
-    up_b = st.file_uploader("Sube Envíos Encargomio (Envios_Encargomio)", type=["xlsx", "xls"])
-with col3:
-    up_p = st.file_uploader("Sube Productos por casillero", type=["xlsx", "xls"])
-
-st.markdown("### Contingencia")
-contingencia_activa = st.toggle(
-    "Activar contingencia para un casillero puntual",
-    value=False,
-    help="Deja el primer registro nuevo del casillero con destinatario real y simula los siguientes.",
+modo = st.radio(
+    "Selecciona el proceso",
+    ["Manifiestos Luma", "Celulares Fénix"],
+    horizontal=True,
 )
 
-cont_casillero = ""
-cont_nombre = ""
-cont_direccion = ""
-cont_telefono = ""
-cont_ciudad = ""
-cont_estado = ""
-contingencia_lista = True
+if modo == "Manifiestos Luma":
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        up_a = st.file_uploader("Sube Pistoleo de bodega (Envios pistoleo)", type=["xlsx", "xls"])
+    with col2:
+        up_b = st.file_uploader("Sube Envíos Encargomio (Envios_Encargomio)", type=["xlsx", "xls"])
+    with col3:
+        up_p = st.file_uploader("Sube Productos por casillero", type=["xlsx", "xls"])
 
-if contingencia_activa:
-    st.info("La contingencia solo afecta guías nuevas del casillero indicado en esta corrida.")
+    st.markdown("### Contingencia")
+    contingencia_activa = st.toggle(
+        "Activar contingencia para un casillero puntual",
+        value=False,
+        help="Deja el primer registro nuevo del casillero con destinatario real y simula los siguientes.",
+    )
 
-    cont_col1, cont_col2, cont_col3 = st.columns(3)
-    with cont_col1:
-        cont_casillero = st.text_input("Casillero de contingencia")
-        cont_nombre = st.text_input("Nombre destinatario real")
-    with cont_col2:
-        cont_direccion = st.text_input("Dirección destinatario real")
-        cont_telefono = st.text_input("Teléfono destinatario real")
-    with cont_col3:
-        cont_ciudad = st.text_input("Ciudad destinatario real")
-        cont_estado = st.text_input("Estado destinatario real")
-
-    campos_contingencia = [
-        cont_casillero,
-        cont_nombre,
-        cont_direccion,
-        cont_telefono,
-        cont_ciudad,
-        cont_estado,
-    ]
-    contingencia_lista = all(_clean_optional_text(v) for v in campos_contingencia)
-
-    if not contingencia_lista:
-        st.warning("Completa casillero y todos los datos reales del destinatario para usar la contingencia.")
-
-run = st.button(
-    "Procesar y actualizar histórico en Dropbox",
-    type="primary",
-    disabled=not (up_a and up_b and up_p and contingencia_lista)
-)
-if run:
-    # -----------------------------
-    # 1) Leer histórico de Dropbox
-    # -----------------------------
-    dbx = get_dbx()
-    def load_historico_or_empty(dbx: dropbox.Dropbox, path: str) -> pd.DataFrame:
-        # Columnas mínimas esperadas del histórico
-        base_cols = [
-            "FECHA GUIA", "guia", "COMPAÑÍA REMITENTE", "REMITENTE DIRECCION", "REMITENTE TELEFONO",
-            "REMITENTE CIUDAD", "REMITENTE ESTADO", "NOMBRE DESTINO", "DESTINO DIRECCION",
-            "DESTINO TELEFONO", "DESTINO CIUDAD", "CONTENIDO", "PESO LIBRAS", "PESO KILOS",
-            "VALOR DECLARADO", "PIEZAS", "DESTINO ESTADO", "POSICION ARANCELARIA", "MANIFIESTO","INSTRUCCIONES",
-            "CASILLERO", "VALOR"  # útil para lógica de manifiesto
-        ]
-        try:
-            _, res = dbx.files_download(path)
-            df = pd.read_excel(io.BytesIO(res.content), sheet_name=0)
-            # asegurar columna guia si viene como GUIA u otra variante
-            if "guia" not in df.columns and "GUIA" in df.columns:
-                df = df.rename(columns={"GUIA": "guia"})
-            return df
-        except dropbox.exceptions.ApiError as e:
-            # si no existe, arrancar vacío
-            if getattr(e, "error", None) and e.error.is_path() and e.error.get_path().is_not_found():
-                return pd.DataFrame(columns=base_cols)
-            raise  # cualquier otro error sí lo mostramos
-    df_historico = load_historico_or_empty(dbx, DBX_FILE_PATH)
-
-    st.success(f"Histórico descargado: {df_historico.shape[0]} filas")
-
-    # -----------------------------
-    # 2) Leer archivos subidos (A y B)
-    # -----------------------------
-    df_a = pd.read_excel(up_a)
-    df_b = pd.read_excel(up_b)
-
-    st.info(f"A (Pistoleo): {df_a.shape} | B (Encargomio): {df_b.shape}")
-
-    # -----------------------------
-    # 3) Asegurar STR + limpieza .0 en llaves originales
-    # -----------------------------
-    df_a["Envio"] = _clean_str_series(df_a["Envio"])
-    df_a = df_a.drop_duplicates(subset=["Envio"], keep="first").copy()
-    
-    df_b["NUMERO ENVIO"] = _clean_str_series(df_b["NUMERO ENVIO"])
-
-    # -----------------------------
-    # 4) Renombres remitente
-    # -----------------------------
-    rename_map = {
-        "CLIENTE DESTINO": "NOMBRE DESTINO",
-        "CIUDAD DESTINO": "DESTINO CIUDAD",
-        "DEPARTAMENTO DESTINO": "DESTINO ESTADO",
-    }
-    alias_cols = {
-        "DIRECCIÓN DESTINO": "DESTINO DIRECCION",
-        "DIRECCIÃ“N DESTINO": "DESTINO DIRECCION",
-        "TELÉFONO": "DESTINO TELEFONO",
-        "TELÃ‰FONO": "DESTINO TELEFONO",
-    }
-
-    for src, dst in alias_cols.items():
-        if src in df_b.columns:
-            df_b = df_b.rename(columns={src: dst})
-
-    faltantes = [c for c in rename_map.keys() if c not in df_b.columns]
-    if faltantes:
-        st.error(f"Faltan columnas en B: {faltantes}")
-        st.stop()
-
-    df_b = df_b.rename(columns=rename_map)
-
-    faltantes_alias = [c for c in ["DESTINO DIRECCION", "DESTINO TELEFONO"] if c not in df_b.columns]
-    if faltantes_alias:
-        st.error(f"Faltan columnas en B: {faltantes_alias}")
-        st.stop()
-
-    # -----------------------------
-
-
-    
-
-    df_b["COMPAÑÍA REMITENTE"] =  "Largo Easy Corp"
-    df_b["REMITENTE DIRECCION"] = "11860 SW 144th Ct Ste 2"
-    df_b["REMITENTE TELEFONO"] = "3053996614"
-    df_b["REMITENTE CIUDAD"] = "Miami"
-    df_b["REMITENTE ESTADO"] = "FL"
-
-    
-    
-
-
-    # -----------------------------
-    # 6) Renombrar llaves a guia
-    # -----------------------------
-    df_a = df_a.rename(columns={"Envio": "guia"})
-    df_b = df_b.rename(columns={"NUMERO ENVIO": "guia"})
-
-    df_a["guia"] = _clean_str_series(df_a["guia"])
-    df_b["guia"] = _clean_str_series(df_b["guia"])
-    if "CATEGORÍAS PRODUCTOS" in df_b.columns:
-        df_b = df_b.rename(columns={"CATEGORÍAS PRODUCTOS": "CONTENIDO"})
-
-    # -----------------------------
-    # 7) Selección columnas B + PESO -> PESO LIBRAS
-    # -----------------------------
-    cols_b = [
-        "guia",
-        "CASILLERO",
-        "VALOR",
-        "COMPAÑÍA REMITENTE",
-        "REMITENTE DIRECCION",
-        "REMITENTE TELEFONO",
-        "REMITENTE CIUDAD",
-        "REMITENTE ESTADO",
-        "NOMBRE DESTINO",
-        "DESTINO DIRECCION",
-        "DESTINO TELEFONO",
-        "DESTINO CIUDAD",
-        "DESTINO ESTADO",
-        "PESO",
-    ]
-    falt_b = [c for c in cols_b if c not in df_b.columns]
-    if falt_b:
-        st.error(f"Faltan columnas requeridas en B para el cruce: {falt_b}")
-        st.stop()
-
-    df_b_sel = df_b[cols_b].rename(columns={"PESO": "PESO LIBRAS"})
-
-    # -----------------------------
-    # 8) Merge
-    # -----------------------------
-    df_final = df_a.merge(df_b_sel, how="left", on="guia")
-    df_final["_ES_CONTINGENCIA"] = False
-    df_final["CONTINGENCIA_REAL"] = False
+    cont_casillero = ""
+    cont_nombre = ""
+    cont_direccion = ""
+    cont_telefono = ""
+    cont_ciudad = ""
+    cont_estado = ""
+    contingencia_lista = True
 
     if contingencia_activa:
-        destinatario_real = _build_destinatario_real(
+        st.info("La contingencia solo afecta guías nuevas del casillero indicado en esta corrida.")
+
+        cont_col1, cont_col2, cont_col3 = st.columns(3)
+        with cont_col1:
+            cont_casillero = st.text_input("Casillero de contingencia")
+            cont_nombre = st.text_input("Nombre destinatario real")
+        with cont_col2:
+            cont_direccion = st.text_input("Dirección destinatario real")
+            cont_telefono = st.text_input("Teléfono destinatario real")
+        with cont_col3:
+            cont_ciudad = st.text_input("Ciudad destinatario real")
+            cont_estado = st.text_input("Estado destinatario real")
+
+        campos_contingencia = [
+            cont_casillero,
             cont_nombre,
             cont_direccion,
             cont_telefono,
             cont_ciudad,
             cont_estado,
+        ]
+        contingencia_lista = all(_clean_optional_text(v) for v in campos_contingencia)
+
+        if not contingencia_lista:
+            st.warning("Completa casillero y todos los datos reales del destinatario para usar la contingencia.")
+
+    run = st.button(
+        "Procesar y actualizar histórico en Dropbox",
+        type="primary",
+        disabled=not (up_a and up_b and up_p and contingencia_lista)
+    )
+    if run:
+        # -----------------------------
+        # 1) Leer histórico de Dropbox
+        # -----------------------------
+        dbx = get_dbx()
+        def load_historico_or_empty(dbx: dropbox.Dropbox, path: str) -> pd.DataFrame:
+            # Columnas mínimas esperadas del histórico
+            base_cols = [
+                "FECHA GUIA", "guia", "COMPAÑÍA REMITENTE", "REMITENTE DIRECCION", "REMITENTE TELEFONO",
+                "REMITENTE CIUDAD", "REMITENTE ESTADO", "NOMBRE DESTINO", "DESTINO DIRECCION",
+                "DESTINO TELEFONO", "DESTINO CIUDAD", "CONTENIDO", "PESO LIBRAS", "PESO KILOS",
+                "VALOR DECLARADO", "PIEZAS", "DESTINO ESTADO", "POSICION ARANCELARIA", "MANIFIESTO","INSTRUCCIONES",
+                "CASILLERO", "VALOR"  # útil para lógica de manifiesto
+            ]
+            try:
+                _, res = dbx.files_download(path)
+                df = pd.read_excel(io.BytesIO(res.content), sheet_name=0)
+                # asegurar columna guia si viene como GUIA u otra variante
+                if "guia" not in df.columns and "GUIA" in df.columns:
+                    df = df.rename(columns={"GUIA": "guia"})
+                return df
+            except dropbox.exceptions.ApiError as e:
+                # si no existe, arrancar vacío
+                if getattr(e, "error", None) and e.error.is_path() and e.error.get_path().is_not_found():
+                    return pd.DataFrame(columns=base_cols)
+                raise  # cualquier otro error sí lo mostramos
+        df_historico = load_historico_or_empty(dbx, DBX_FILE_PATH)
+
+        st.success(f"Histórico descargado: {df_historico.shape[0]} filas")
+
+        # -----------------------------
+        # 2) Leer archivos subidos (A y B)
+        # -----------------------------
+        df_a = pd.read_excel(up_a)
+        df_b = pd.read_excel(up_b)
+
+        st.info(f"A (Pistoleo): {df_a.shape} | B (Encargomio): {df_b.shape}")
+
+        # -----------------------------
+        # 3) Asegurar STR + limpieza .0 en llaves originales
+        # -----------------------------
+        df_a["Envio"] = _clean_str_series(df_a["Envio"])
+        df_a = df_a.drop_duplicates(subset=["Envio"], keep="first").copy()
+    
+        df_b["NUMERO ENVIO"] = _clean_str_series(df_b["NUMERO ENVIO"])
+
+        # -----------------------------
+        # 4) Renombres remitente
+        # -----------------------------
+        rename_map = {
+            "CLIENTE DESTINO": "NOMBRE DESTINO",
+            "CIUDAD DESTINO": "DESTINO CIUDAD",
+            "DEPARTAMENTO DESTINO": "DESTINO ESTADO",
+        }
+        alias_cols = {
+            "DIRECCIÓN DESTINO": "DESTINO DIRECCION",
+            "DIRECCIÃ“N DESTINO": "DESTINO DIRECCION",
+            "TELÉFONO": "DESTINO TELEFONO",
+            "TELÃ‰FONO": "DESTINO TELEFONO",
+        }
+
+        for src, dst in alias_cols.items():
+            if src in df_b.columns:
+                df_b = df_b.rename(columns={src: dst})
+
+        faltantes = [c for c in rename_map.keys() if c not in df_b.columns]
+        if faltantes:
+            st.error(f"Faltan columnas en B: {faltantes}")
+            st.stop()
+
+        df_b = df_b.rename(columns=rename_map)
+
+        faltantes_alias = [c for c in ["DESTINO DIRECCION", "DESTINO TELEFONO"] if c not in df_b.columns]
+        if faltantes_alias:
+            st.error(f"Faltan columnas en B: {faltantes_alias}")
+            st.stop()
+
+        # -----------------------------
+
+
+    
+
+        df_b["COMPAÑÍA REMITENTE"] =  "Largo Easy Corp"
+        df_b["REMITENTE DIRECCION"] = "11860 SW 144th Ct Ste 2"
+        df_b["REMITENTE TELEFONO"] = "3053996614"
+        df_b["REMITENTE CIUDAD"] = "Miami"
+        df_b["REMITENTE ESTADO"] = "FL"
+
+    
+    
+
+
+        # -----------------------------
+        # 6) Renombrar llaves a guia
+        # -----------------------------
+        df_a = df_a.rename(columns={"Envio": "guia"})
+        df_b = df_b.rename(columns={"NUMERO ENVIO": "guia"})
+
+        df_a["guia"] = _clean_str_series(df_a["guia"])
+        df_b["guia"] = _clean_str_series(df_b["guia"])
+        if "CATEGORÍAS PRODUCTOS" in df_b.columns:
+            df_b = df_b.rename(columns={"CATEGORÍAS PRODUCTOS": "CONTENIDO"})
+
+        # -----------------------------
+        # 7) Selección columnas B + PESO -> PESO LIBRAS
+        # -----------------------------
+        cols_b = [
+            "guia",
+            "CASILLERO",
+            "VALOR",
+            "COMPAÑÍA REMITENTE",
+            "REMITENTE DIRECCION",
+            "REMITENTE TELEFONO",
+            "REMITENTE CIUDAD",
+            "REMITENTE ESTADO",
+            "NOMBRE DESTINO",
+            "DESTINO DIRECCION",
+            "DESTINO TELEFONO",
+            "DESTINO CIUDAD",
+            "DESTINO ESTADO",
+            "PESO",
+        ]
+        falt_b = [c for c in cols_b if c not in df_b.columns]
+        if falt_b:
+            st.error(f"Faltan columnas requeridas en B para el cruce: {falt_b}")
+            st.stop()
+
+        df_b_sel = df_b[cols_b].rename(columns={"PESO": "PESO LIBRAS"})
+
+        # -----------------------------
+        # 8) Merge
+        # -----------------------------
+        df_final = df_a.merge(df_b_sel, how="left", on="guia")
+        df_final["_ES_CONTINGENCIA"] = False
+        df_final["CONTINGENCIA_REAL"] = False
+
+        if contingencia_activa:
+            destinatario_real = _build_destinatario_real(
+                cont_nombre,
+                cont_direccion,
+                cont_telefono,
+                cont_ciudad,
+                cont_estado,
+            )
+
+            # Aplicar contingencia solo sobre guías que no están en el histórico
+            guias_en_historico = set(_clean_str_series(df_historico["guia"]).dropna())
+            mask_nuevas = ~df_final["guia"].isin(guias_en_historico)
+
+            df_nuevas = df_final[mask_nuevas].copy()
+            df_viejas = df_final[~mask_nuevas].copy()
+
+            df_nuevas, total_contingencia = apply_contingencia_destinatario(
+                df_nuevas,
+                cont_casillero,
+                destinatario_real,
+            )
+
+            df_final = pd.concat([df_viejas, df_nuevas], ignore_index=True)
+
+            if total_contingencia == 0:
+                st.warning(
+                    f"Contingencia activa, pero no se encontraron guías nuevas para el casillero {_norm_casillero(cont_casillero)}."
+                )
+            else:
+                simuladas = max(total_contingencia - 1, 0)
+                st.info(
+                    f"Contingencia aplicada a {total_contingencia} guía(s) nuevas de {_norm_casillero(cont_casillero)}: 1 real y {simuladas} simulada(s)."
+                )
+
+        # -----------------------------
+    # 8.1) Columnas nuevas
+    # -----------------------------
+        df_final["PIEZAS"] = 1
+        df_final["VALOR DECLARADO"] = np.random.randint(91, 100, size=len(df_final))  # 91–99
+        df_final["POSICION ARANCELARIA"] = "980720"
+        df_final["POSICION ARANCELARIA"] = df_final["POSICION ARANCELARIA"].astype("string")
+
+        # -----------------------------
+        # 9) PESO KILOS + FECHA GUIA Miami
+        # -----------------------------
+        df_final["PESO LIBRAS"] = pd.to_numeric(df_final["PESO LIBRAS"], errors="coerce")
+        df_final["PESO KILOS"] = df_final["PESO LIBRAS"] / 2.2
+
+        hoy_miami = datetime.now(ZoneInfo("America/New_York")).date()
+        df_final["FECHA GUIA"] = pd.to_datetime(hoy_miami)
+
+
+        # -----------------------------
+        # 9.1) COSTO en filas nuevas (para validar antes de subir)
+        # -----------------------------
+        w_new = df_final["PESO LIBRAS"]
+    
+        df_final["COSTO"] = np.where(
+            w_new.isna() | (w_new <= 0),
+            0,
+            np.where(
+                w_new == 1,
+                7.25,
+                7.25 + (w_new - 1) * 2.6
+            ) + np.where(w_new >= 20, 4.75, 0)
+        ).round(2)
+    
+    
+    
+        # -----------------------------
+    # -----------------------------
+        # 9.2) VALIDACIÓN BLOQUEANTE
+        # Si una guía nueva no encontró peso/costo, se detiene el proceso
+        # EXCEPTO guías permitidas
+        # -----------------------------
+    
+        GUIAS_EXCLUIDAS_ALERTA = {"85674", "8646","82760","83685","84147","84243","84554","84657","84670","84722","84457","84669","84663","84540","84827","84862","84824","84793","84806","84826","84818","84840","84950","84916","84874","84940","84956","84958","85029","84964","85024","85043","85048","85017","85046","85016","85008","85006","85036","85191","85194","85130","85169","85136","85152","85159","85161","85157","85173","85126","85125","85142","85140","85154","85155","85156","85128","85138","85139","85097","85187","85188","85186","85085","85084","85121","85163","85133","85141","85120","85093","85211","85210","85206","85204","85197","85201","85202","85203","85212","85198","85199","85205","85200","85208","85321","85322","85320","85317","85319","85318","85314","85312","85313","85316","85244","85333","85340","85302","85269","85304","85275","85280","85273","85266","85271","85267","85256","85251","85233","85341","85331","85332","85327","85342","85344","85240","85227","85292","85305","85264","85254","85265","85277","85282","85228","85260","85261","85259","85278","85241","85270","85229","85272","85345","85378","85368","85346","85360","85362","85377","85374","85347","85348","85375","85372","85400","85398","85349","85351","85370","85393","85406","85423","85427","85425","85424","85428","85426","85402","85421","85413","85422","85420","85382","85411","85404","85405","85401","85412","85449","85445","85446","85444","85441","85443","85450","85431","85373","85410","85379","85392","85350","85354","85353","85387","85367"}
+    
+        # normalizar guia como texto limpio
+        df_final["guia"] = _clean_str_series(df_final["guia"])
+
+        mask_error_nuevos = (
+            df_final["PESO LIBRAS"].isna()
+            | (df_final["PESO LIBRAS"] <= 0)
         )
 
-        # Aplicar contingencia solo sobre guías que no están en el histórico
-        guias_en_historico = set(_clean_str_series(df_historico["guia"]).dropna())
-        mask_nuevas = ~df_final["guia"].isin(guias_en_historico)
+        # guías ya registradas en histórico con FECHA GUIA > 4 días → excluir de alerta
+        limite_alerta = pd.Timestamp(hoy_miami) - pd.Timedelta(days=4)
+        guias_viejas_historico = set()
+        if "FECHA GUIA" in df_historico.columns and not df_historico.empty:
+            fechas_hist = pd.to_datetime(df_historico["FECHA GUIA"], errors="coerce")
+            mask_viejas = fechas_hist < limite_alerta
+            guias_viejas_historico = set(
+                _clean_str_series(df_historico.loc[mask_viejas, "guia"]).dropna()
+            )
 
-        df_nuevas = df_final[mask_nuevas].copy()
-        df_viejas = df_final[~mask_nuevas].copy()
-
-        df_nuevas, total_contingencia = apply_contingencia_destinatario(
-            df_nuevas,
-            cont_casillero,
-            destinatario_real,
+        mask_excluidas = (
+            df_final["guia"].isin(GUIAS_EXCLUIDAS_ALERTA)
+            | df_final["guia"].isin(guias_viejas_historico)
         )
-
-        df_final = pd.concat([df_viejas, df_nuevas], ignore_index=True)
-
-        if total_contingencia == 0:
+    
+        df_errores_nuevos = df_final.loc[
+            mask_error_nuevos & ~mask_excluidas,
+            ["guia", "PESO LIBRAS", "COSTO"]
+        ].copy()
+    
+        if not df_errores_nuevos.empty:
+            st.error("❌ Proceso detenido. Hay guías nuevas pistoleadas que no fueron encontradas correctamente en Envíos Encargomio.")
+    
             st.warning(
-                f"Contingencia activa, pero no se encontraron guías nuevas para el casillero {_norm_casillero(cont_casillero)}."
+                "Revisa las siguientes guías pistoleadas. "
+                "Tienen PESO LIBRAS vacío, menor o igual a 0, o COSTO en 0. "
+                "Por eso el histórico no se cargará."
             )
-        else:
-            simuladas = max(total_contingencia - 1, 0)
-            st.info(
-                f"Contingencia aplicada a {total_contingencia} guía(s) nuevas de {_norm_casillero(cont_casillero)}: 1 real y {simuladas} simulada(s)."
-            )
-
-    # -----------------------------
-# 8.1) Columnas nuevas
-# -----------------------------
-    df_final["PIEZAS"] = 1
-    df_final["VALOR DECLARADO"] = np.random.randint(91, 100, size=len(df_final))  # 91–99
-    df_final["POSICION ARANCELARIA"] = "980720"
-    df_final["POSICION ARANCELARIA"] = df_final["POSICION ARANCELARIA"].astype("string")
-
-    # -----------------------------
-    # 9) PESO KILOS + FECHA GUIA Miami
-    # -----------------------------
-    df_final["PESO LIBRAS"] = pd.to_numeric(df_final["PESO LIBRAS"], errors="coerce")
-    df_final["PESO KILOS"] = df_final["PESO LIBRAS"] / 2.2
-
-    hoy_miami = datetime.now(ZoneInfo("America/New_York")).date()
-    df_final["FECHA GUIA"] = pd.to_datetime(hoy_miami)
-
-
-    # -----------------------------
-    # 9.1) COSTO en filas nuevas (para validar antes de subir)
-    # -----------------------------
-    w_new = df_final["PESO LIBRAS"]
     
-    df_final["COSTO"] = np.where(
-        w_new.isna() | (w_new <= 0),
-        0,
-        np.where(
-            w_new == 1,
-            7.25,
-            7.25 + (w_new - 1) * 2.6
-        ) + np.where(w_new >= 20, 4.75, 0)
-    ).round(2)
+            st.dataframe(df_errores_nuevos, use_container_width=True)
     
+            guias_error = df_errores_nuevos["guia"].dropna().astype(str).tolist()
+            st.markdown("**Guías con problema:**")
+            st.write(", ".join(guias_error))
     
-    
-    # -----------------------------
-# -----------------------------
-    # 9.2) VALIDACIÓN BLOQUEANTE
-    # Si una guía nueva no encontró peso/costo, se detiene el proceso
-    # EXCEPTO guías permitidas
-    # -----------------------------
-    
-    GUIAS_EXCLUIDAS_ALERTA = {"85674", "8646","82760","83685","84147","84243","84554","84657","84670","84722","84457","84669","84663","84540","84827","84862","84824","84793","84806","84826","84818","84840","84950","84916","84874","84940","84956","84958","85029","84964","85024","85043","85048","85017","85046","85016","85008","85006","85036","85191","85194","85130","85169","85136","85152","85159","85161","85157","85173","85126","85125","85142","85140","85154","85155","85156","85128","85138","85139","85097","85187","85188","85186","85085","85084","85121","85163","85133","85141","85120","85093","85211","85210","85206","85204","85197","85201","85202","85203","85212","85198","85199","85205","85200","85208","85321","85322","85320","85317","85319","85318","85314","85312","85313","85316","85244","85333","85340","85302","85269","85304","85275","85280","85273","85266","85271","85267","85256","85251","85233","85341","85331","85332","85327","85342","85344","85240","85227","85292","85305","85264","85254","85265","85277","85282","85228","85260","85261","85259","85278","85241","85270","85229","85272","85345","85378","85368","85346","85360","85362","85377","85374","85347","85348","85375","85372","85400","85398","85349","85351","85370","85393","85406","85423","85427","85425","85424","85428","85426","85402","85421","85413","85422","85420","85382","85411","85404","85405","85401","85412","85449","85445","85446","85444","85441","85443","85450","85431","85373","85410","85379","85392","85350","85354","85353","85387","85367"}
-    
-    # normalizar guia como texto limpio
-    df_final["guia"] = _clean_str_series(df_final["guia"])
+            st.stop()
 
-    mask_error_nuevos = (
-        df_final["PESO LIBRAS"].isna()
-        | (df_final["PESO LIBRAS"] <= 0)
-    )
 
-    # guías ya registradas en histórico con FECHA GUIA > 4 días → excluir de alerta
-    limite_alerta = pd.Timestamp(hoy_miami) - pd.Timedelta(days=4)
-    guias_viejas_historico = set()
-    if "FECHA GUIA" in df_historico.columns and not df_historico.empty:
-        fechas_hist = pd.to_datetime(df_historico["FECHA GUIA"], errors="coerce")
-        mask_viejas = fechas_hist < limite_alerta
-        guias_viejas_historico = set(
-            _clean_str_series(df_historico.loc[mask_viejas, "guia"]).dropna()
+
+        # -----------------------------
+        # 10) Concat + dedup (histórico manda)
+        # -----------------------------
+        df_historico["guia"] = _clean_str_series(df_historico["guia"])
+        df_final["guia"] = _clean_str_series(df_final["guia"])
+        df_historico["_ES_CONTINGENCIA"] = False
+        df_final["_ES_CONTINGENCIA"] = df_final["_ES_CONTINGENCIA"].fillna(False)
+        if "CONTINGENCIA_REAL" not in df_historico.columns:
+            df_historico["CONTINGENCIA_REAL"] = False
+        df_historico["CONTINGENCIA_REAL"] = df_historico["CONTINGENCIA_REAL"].fillna(False)
+        df_final["CONTINGENCIA_REAL"] = df_final["CONTINGENCIA_REAL"].fillna(False)
+
+        df_concat = pd.concat([df_historico, df_final], ignore_index=True)
+        df_concat = df_concat.drop_duplicates(subset=["guia"], keep="first").reset_index(drop=True)
+
+        # -----------------------------
+        # 11) Crear MANIFIESTO solo a vacíos con regla 11591 vs otros
+        # -----------------------------
+        if "MANIFIESTO" not in df_concat.columns:
+            df_concat["MANIFIESTO"] = pd.NA
+
+        if "_ES_CONTINGENCIA" not in df_concat.columns:
+            df_concat["_ES_CONTINGENCIA"] = False
+
+        df_concat["_ES_CONTINGENCIA"] = df_concat["_ES_CONTINGENCIA"].fillna(False).astype(bool)
+        df_concat["CASILLERO_NORM"] = df_concat["CASILLERO"].apply(_norm_casillero)
+        df_concat["MANIFIESTO_NUM"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce")
+
+        mask_vacio = df_concat["MANIFIESTO_NUM"].isna()
+        mask_contingencia = df_concat["_ES_CONTINGENCIA"]
+        mask_11591 = df_concat["CASILLERO_NORM"] == "CA11591"
+        man_num_str = df_concat["MANIFIESTO_NUM"].astype("Int64").astype("string")
+
+        max_11591 = df_concat.loc[~mask_vacio & mask_11591 & ~mask_contingencia, "MANIFIESTO_NUM"].max()
+        max_otros = df_concat.loc[~mask_vacio & ~mask_11591 & ~mask_contingencia, "MANIFIESTO_NUM"].max()
+        max_contingencia = df_concat.loc[
+            df_concat["MANIFIESTO_NUM"].notna() & man_num_str.str.startswith("4").fillna(False),
+            "MANIFIESTO_NUM"
+        ].max()
+
+        if pd.isna(max_11591):
+            max_11591 = 900000
+        if pd.isna(max_otros):
+            max_otros = 100000
+        if pd.isna(max_contingencia):
+            max_contingencia = 400000
+
+        nuevo_man_11591 = int(max_11591) + 1
+        nuevo_man_otros = int(max_otros) + 1
+        nuevo_man_contingencia = int(max_contingencia) + 1 if mask_contingencia.any() else None
+
+        if nuevo_man_contingencia is not None:
+            df_concat.loc[mask_vacio & mask_contingencia, "MANIFIESTO"] = nuevo_man_contingencia
+        df_concat.loc[mask_vacio & mask_11591 & ~mask_contingencia, "MANIFIESTO"] = nuevo_man_11591
+        df_concat.loc[mask_vacio & ~mask_11591 & ~mask_contingencia, "MANIFIESTO"] = nuevo_man_otros
+
+        df_concat["MANIFIESTO"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce").astype("Int64")
+        df_concat = df_concat.drop(columns=["CASILLERO_NORM", "MANIFIESTO_NUM", "_ES_CONTINGENCIA"], errors="ignore")
+        # -----------------------------
+        # 11.5) Reordenar columnas para export
+        # -----------------------------
+        orden_cols = [
+            "FECHA GUIA",
+            "guia",
+            "COMPAÑÍA REMITENTE",
+            "REMITENTE DIRECCION",
+            "REMITENTE TELEFONO",
+            "REMITENTE CIUDAD",
+            "REMITENTE ESTADO",
+            "NOMBRE DESTINO",
+            "DESTINO DIRECCION",
+            "DESTINO TELEFONO",
+            "DESTINO CIUDAD",
+            "CONTENIDO",
+            "PESO LIBRAS",
+            "PESO KILOS",
+            "VALOR DECLARADO",
+            "PIEZAS",
+            "DESTINO ESTADO",
+            "POSICION ARANCELARIA",
+            "MANIFIESTO",
+            "INSTRUCCIONES",
+            "CASILLERO",
+            "VALOR"
+        ]
+    
+        # solo deja las que existan (por si el histórico viejo trae extras)
+        presentes = [c for c in orden_cols if c in df_concat.columns]
+        extras = [c for c in df_concat.columns if c not in presentes]
+        df_concat = df_concat[presentes + extras]
+        # -----------------------------
+        # X) COSTO (se guarda en Dropbox)
+        # -----------------------------
+        df_concat["PESO LIBRAS"] = pd.to_numeric(df_concat["PESO LIBRAS"], errors="coerce")
+        w = df_concat["PESO LIBRAS"]
+    
+        df_concat["COSTO"] = np.where(
+            w.isna() | (w <= 0),
+            0,
+            np.where(
+                w == 1,
+                7.25,
+                7.25 + (w - 1) * 2.6
+            ) + np.where(w >= 20, 4.75, 0)
+        ).round(2)
+    
+        # -----------------------------
+        # X) Resumen COSTO por manifiesto (para hoja 2)
+        # -----------------------------
+        # Asegurar numéricos
+        for col in ["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]:
+            if col in df_concat.columns:
+                df_concat[col] = pd.to_numeric(df_concat[col], errors="coerce")
+    
+        df_costos_manifiesto = (
+            df_concat
+            .groupby("MANIFIESTO", dropna=False, as_index=False)[["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]]
+            .sum(min_count=1)
         )
+    
+        # (opcional) ordenar
+        df_costos_manifiesto = df_costos_manifiesto.sort_values("MANIFIESTO", na_position="last")
+    
+    
+    
+    
+        # =========================
+        # PRODUCTOS -> PRODUCTOS_RAW (solo si CONTENIDO está vacío)
+        # =========================
+    
+        # 0) Cargar archivo productos (si ya lo tienes, omite esta línea)
+    # =========================
+    # PRODUCTOS (df_p) -> resumen por Envio usando Peso
+    # y cruce SOLO para filas sin CONTENIDO
+    # =========================
 
-    mask_excluidas = (
-        df_final["guia"].isin(GUIAS_EXCLUIDAS_ALERTA)
-        | df_final["guia"].isin(guias_viejas_historico)
-    )
+    # df_p ya leído (si no:)
+        df_p = pd.read_excel(up_p)
     
-    df_errores_nuevos = df_final.loc[
-        mask_error_nuevos & ~mask_excluidas,
-        ["guia", "PESO LIBRAS", "COSTO"]
-    ].copy()
+        COL_ENVIO = "Envío"
+        COL_PROD  = "Nombre producto"
+        COL_PESO  = "Peso"
     
-    if not df_errores_nuevos.empty:
-        st.error("❌ Proceso detenido. Hay guías nuevas pistoleadas que no fueron encontradas correctamente en Envíos Encargomio.")
+        df_prod = df_p[[COL_ENVIO, COL_PROD, COL_PESO]].copy()
     
-        st.warning(
-            "Revisa las siguientes guías pistoleadas. "
-            "Tienen PESO LIBRAS vacío, menor o igual a 0, o COSTO en 0. "
-            "Por eso el histórico no se cargará."
+        df_prod[COL_ENVIO] = _clean_str_series(df_prod[COL_ENVIO])
+        df_prod[COL_PROD]  = df_prod[COL_PROD].astype("string").fillna("").str.strip()
+        df_prod[COL_PESO]  = pd.to_numeric(df_prod[COL_PESO], errors="coerce").fillna(0)
+    
+        df_prod = df_prod[df_prod[COL_PROD] != ""].copy()
+    
+        # ✅ DEDUP real: colapsa repetidos (Envio, Producto) sumando Peso
+        df_prod = (
+            df_prod
+            .groupby([COL_ENVIO, COL_PROD], as_index=False)[COL_PESO]
+            .sum()
         )
     
-        st.dataframe(df_errores_nuevos, use_container_width=True)
+        # Dominante (máximo peso total por envío)
+        idx_dom = df_prod.groupby(COL_ENVIO)[COL_PESO].idxmax()
+        df_dom = (
+            df_prod.loc[idx_dom, [COL_ENVIO, COL_PROD, COL_PESO]]
+            .rename(columns={COL_PROD: "PRODUCTO_DOMINANTE", COL_PESO: "PESO_DOMINANTE"})
+        )
     
-        guias_error = df_errores_nuevos["guia"].dropna().astype(str).tolist()
-        st.markdown("**Guías con problema:**")
-        st.write(", ".join(guias_error))
+        # Lista (ordenada por peso desc, ya sin repetidos)
+        df_list = (
+            df_prod.sort_values([COL_ENVIO, COL_PESO], ascending=[True, False])
+            .groupby(COL_ENVIO, as_index=False)[COL_PROD]
+            .apply(lambda s: " | ".join(s.head(50).tolist()))
+            .rename(columns={COL_PROD: "PRODUCTOS_LISTA"})
+        )
     
-        st.stop()
-
-
-
-    # -----------------------------
-    # 10) Concat + dedup (histórico manda)
-    # -----------------------------
-    df_historico["guia"] = _clean_str_series(df_historico["guia"])
-    df_final["guia"] = _clean_str_series(df_final["guia"])
-    df_historico["_ES_CONTINGENCIA"] = False
-    df_final["_ES_CONTINGENCIA"] = df_final["_ES_CONTINGENCIA"].fillna(False)
-    if "CONTINGENCIA_REAL" not in df_historico.columns:
-        df_historico["CONTINGENCIA_REAL"] = False
-    df_historico["CONTINGENCIA_REAL"] = df_historico["CONTINGENCIA_REAL"].fillna(False)
-    df_final["CONTINGENCIA_REAL"] = df_final["CONTINGENCIA_REAL"].fillna(False)
-
-    df_concat = pd.concat([df_historico, df_final], ignore_index=True)
-    df_concat = df_concat.drop_duplicates(subset=["guia"], keep="first").reset_index(drop=True)
-
-    # -----------------------------
-    # 11) Crear MANIFIESTO solo a vacíos con regla 11591 vs otros
-    # -----------------------------
-    if "MANIFIESTO" not in df_concat.columns:
-        df_concat["MANIFIESTO"] = pd.NA
-
-    if "_ES_CONTINGENCIA" not in df_concat.columns:
-        df_concat["_ES_CONTINGENCIA"] = False
-
-    df_concat["_ES_CONTINGENCIA"] = df_concat["_ES_CONTINGENCIA"].fillna(False).astype(bool)
-    df_concat["CASILLERO_NORM"] = df_concat["CASILLERO"].apply(_norm_casillero)
-    df_concat["MANIFIESTO_NUM"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce")
-
-    mask_vacio = df_concat["MANIFIESTO_NUM"].isna()
-    mask_contingencia = df_concat["_ES_CONTINGENCIA"]
-    mask_11591 = df_concat["CASILLERO_NORM"] == "CA11591"
-    man_num_str = df_concat["MANIFIESTO_NUM"].astype("Int64").astype("string")
-
-    max_11591 = df_concat.loc[~mask_vacio & mask_11591 & ~mask_contingencia, "MANIFIESTO_NUM"].max()
-    max_otros = df_concat.loc[~mask_vacio & ~mask_11591 & ~mask_contingencia, "MANIFIESTO_NUM"].max()
-    max_contingencia = df_concat.loc[
-        df_concat["MANIFIESTO_NUM"].notna() & man_num_str.str.startswith("4").fillna(False),
-        "MANIFIESTO_NUM"
-    ].max()
-
-    if pd.isna(max_11591):
-        max_11591 = 900000
-    if pd.isna(max_otros):
-        max_otros = 100000
-    if pd.isna(max_contingencia):
-        max_contingencia = 400000
-
-    nuevo_man_11591 = int(max_11591) + 1
-    nuevo_man_otros = int(max_otros) + 1
-    nuevo_man_contingencia = int(max_contingencia) + 1 if mask_contingencia.any() else None
-
-    if nuevo_man_contingencia is not None:
-        df_concat.loc[mask_vacio & mask_contingencia, "MANIFIESTO"] = nuevo_man_contingencia
-    df_concat.loc[mask_vacio & mask_11591 & ~mask_contingencia, "MANIFIESTO"] = nuevo_man_11591
-    df_concat.loc[mask_vacio & ~mask_11591 & ~mask_contingencia, "MANIFIESTO"] = nuevo_man_otros
-
-    df_concat["MANIFIESTO"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce").astype("Int64")
-    df_concat = df_concat.drop(columns=["CASILLERO_NORM", "MANIFIESTO_NUM", "_ES_CONTINGENCIA"], errors="ignore")
-    # -----------------------------
-    # 11.5) Reordenar columnas para export
-    # -----------------------------
-    orden_cols = [
-        "FECHA GUIA",
-        "guia",
-        "COMPAÑÍA REMITENTE",
-        "REMITENTE DIRECCION",
-        "REMITENTE TELEFONO",
-        "REMITENTE CIUDAD",
-        "REMITENTE ESTADO",
-        "NOMBRE DESTINO",
-        "DESTINO DIRECCION",
-        "DESTINO TELEFONO",
-        "DESTINO CIUDAD",
-        "CONTENIDO",
-        "PESO LIBRAS",
-        "PESO KILOS",
-        "VALOR DECLARADO",
-        "PIEZAS",
-        "DESTINO ESTADO",
-        "POSICION ARANCELARIA",
-        "MANIFIESTO",
-        "INSTRUCCIONES",
-        "CASILLERO",
-        "VALOR"
-    ]
+        df_prod_agg = df_dom.merge(df_list, on=COL_ENVIO, how="left")
     
-    # solo deja las que existan (por si el histórico viejo trae extras)
-    presentes = [c for c in orden_cols if c in df_concat.columns]
-    extras = [c for c in df_concat.columns if c not in presentes]
-    df_concat = df_concat[presentes + extras]
-    # -----------------------------
-    # X) COSTO (se guarda en Dropbox)
-    # -----------------------------
-    df_concat["PESO LIBRAS"] = pd.to_numeric(df_concat["PESO LIBRAS"], errors="coerce")
-    w = df_concat["PESO LIBRAS"]
+        # ----- cruzar solo los que NO tienen contenido -----
+        df_concat_copy = df_concat.copy()
     
-    df_concat["COSTO"] = np.where(
-        w.isna() | (w <= 0),
-        0,
-        np.where(
-            w == 1,
-            7.25,
-            7.25 + (w - 1) * 2.6
-        ) + np.where(w >= 20, 4.75, 0)
-    ).round(2)
+        df_concat_copy["CONTENIDO"] = df_concat_copy.get(
+            "CONTENIDO", pd.Series([pd.NA] * len(df_concat_copy))
+        ).astype("string")
     
-    # -----------------------------
-    # X) Resumen COSTO por manifiesto (para hoja 2)
-    # -----------------------------
-    # Asegurar numéricos
-    for col in ["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]:
-        if col in df_concat.columns:
-            df_concat[col] = pd.to_numeric(df_concat[col], errors="coerce")
+        mask_sin_contenido = df_concat_copy["CONTENIDO"].isna() | (df_concat_copy["CONTENIDO"].str.strip() == "")
     
-    df_costos_manifiesto = (
-        df_concat
-        .groupby("MANIFIESTO", dropna=False, as_index=False)[["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]]
-        .sum(min_count=1)
-    )
+        df_to_ai = df_concat_copy.loc[mask_sin_contenido].copy()
+        df_to_ai["guia"] = _clean_str_series(df_to_ai["guia"])
     
-    # (opcional) ordenar
-    df_costos_manifiesto = df_costos_manifiesto.sort_values("MANIFIESTO", na_position="last")
+        df_to_ai = df_to_ai.merge(
+            df_prod_agg,
+            how="left",
+            left_on="guia",
+            right_on=COL_ENVIO
+        )
+    
+        df_concat_copy.loc[mask_sin_contenido, "PRODUCTO_DOMINANTE"] = df_to_ai["PRODUCTO_DOMINANTE"].values
+        df_concat_copy.loc[mask_sin_contenido, "PESO_DOMINANTE"] = df_to_ai["PESO_DOMINANTE"].values
+        df_concat_copy.loc[mask_sin_contenido, "PRODUCTOS_LISTA"] = df_to_ai["PRODUCTOS_LISTA"].values
+    
+        def get_openai_client() -> OpenAI:
+            return OpenAI(api_key=st.secrets["openai"]["api_key"])
     
     
+        CATEGORIAS = [
+            "Tenis", "Calzado", "Celular", "Computador", "Componente de computador",
+            "Ropa", "Perfumes", "Cosmeticos", "Accesorios", "Reloj/Joyeria",
+            "Hogar", "Electrodomestico", "Juguetes", "Herramientas",
+            "Suplementos", "Medicamentos", "Alimentos",
+            "Libros/Papeleria", "Miscelaneo"
+        ]
     
-    
-    # =========================
-    # PRODUCTOS -> PRODUCTOS_RAW (solo si CONTENIDO está vacío)
-    # =========================
-    
-    # 0) Cargar archivo productos (si ya lo tienes, omite esta línea)
-# =========================
-# PRODUCTOS (df_p) -> resumen por Envio usando Peso
-# y cruce SOLO para filas sin CONTENIDO
-# =========================
-
-# df_p ya leído (si no:)
-    df_p = pd.read_excel(up_p)
-    
-    COL_ENVIO = "Envío"
-    COL_PROD  = "Nombre producto"
-    COL_PESO  = "Peso"
-    
-    df_prod = df_p[[COL_ENVIO, COL_PROD, COL_PESO]].copy()
-    
-    df_prod[COL_ENVIO] = _clean_str_series(df_prod[COL_ENVIO])
-    df_prod[COL_PROD]  = df_prod[COL_PROD].astype("string").fillna("").str.strip()
-    df_prod[COL_PESO]  = pd.to_numeric(df_prod[COL_PESO], errors="coerce").fillna(0)
-    
-    df_prod = df_prod[df_prod[COL_PROD] != ""].copy()
-    
-    # ✅ DEDUP real: colapsa repetidos (Envio, Producto) sumando Peso
-    df_prod = (
-        df_prod
-        .groupby([COL_ENVIO, COL_PROD], as_index=False)[COL_PESO]
-        .sum()
-    )
-    
-    # Dominante (máximo peso total por envío)
-    idx_dom = df_prod.groupby(COL_ENVIO)[COL_PESO].idxmax()
-    df_dom = (
-        df_prod.loc[idx_dom, [COL_ENVIO, COL_PROD, COL_PESO]]
-        .rename(columns={COL_PROD: "PRODUCTO_DOMINANTE", COL_PESO: "PESO_DOMINANTE"})
-    )
-    
-    # Lista (ordenada por peso desc, ya sin repetidos)
-    df_list = (
-        df_prod.sort_values([COL_ENVIO, COL_PESO], ascending=[True, False])
-        .groupby(COL_ENVIO, as_index=False)[COL_PROD]
-        .apply(lambda s: " | ".join(s.head(50).tolist()))
-        .rename(columns={COL_PROD: "PRODUCTOS_LISTA"})
-    )
-    
-    df_prod_agg = df_dom.merge(df_list, on=COL_ENVIO, how="left")
-    
-    # ----- cruzar solo los que NO tienen contenido -----
-    df_concat_copy = df_concat.copy()
-    
-    df_concat_copy["CONTENIDO"] = df_concat_copy.get(
-        "CONTENIDO", pd.Series([pd.NA] * len(df_concat_copy))
-    ).astype("string")
-    
-    mask_sin_contenido = df_concat_copy["CONTENIDO"].isna() | (df_concat_copy["CONTENIDO"].str.strip() == "")
-    
-    df_to_ai = df_concat_copy.loc[mask_sin_contenido].copy()
-    df_to_ai["guia"] = _clean_str_series(df_to_ai["guia"])
-    
-    df_to_ai = df_to_ai.merge(
-        df_prod_agg,
-        how="left",
-        left_on="guia",
-        right_on=COL_ENVIO
-    )
-    
-    df_concat_copy.loc[mask_sin_contenido, "PRODUCTO_DOMINANTE"] = df_to_ai["PRODUCTO_DOMINANTE"].values
-    df_concat_copy.loc[mask_sin_contenido, "PESO_DOMINANTE"] = df_to_ai["PESO_DOMINANTE"].values
-    df_concat_copy.loc[mask_sin_contenido, "PRODUCTOS_LISTA"] = df_to_ai["PRODUCTOS_LISTA"].values
-    
-    def get_openai_client() -> OpenAI:
-        return OpenAI(api_key=st.secrets["openai"]["api_key"])
-    
-    
-    CATEGORIAS = [
-        "Tenis", "Calzado", "Celular", "Computador", "Componente de computador",
-        "Ropa", "Perfumes", "Cosmeticos", "Accesorios", "Reloj/Joyeria",
-        "Hogar", "Electrodomestico", "Juguetes", "Herramientas",
-        "Suplementos", "Medicamentos", "Alimentos",
-        "Libros/Papeleria", "Miscelaneo"
-    ]
-    
-    # ✅ ESTE es el JSON Schema REAL (raíz type=object)
-    CLASIFICAR_ENVIO_SCHEMA = {
-        "type": "object",
-        "properties": {
-            "categoria": {"type": "string", "enum": CATEGORIAS},
-            "confianza": {"type": "integer", "minimum": 0, "maximum": 100},
-            "contenido": {
-                "type": "string",
-                "description": "Texto corto para CONTENIDO (sin marcas). Ej: 'Calzado (tenis)', 'Celular', 'Ropa'."
-            }
-        },
-        "required": ["categoria", "confianza", "contenido"],
-        "additionalProperties": False
-    }
-    
-    def gpt_clasificar_envio(client: OpenAI, producto_dominante: str, productos_lista: str) -> dict:
-        prompt = f"""
-    Eres un clasificador de envíos para manifiestos.
-    Objetivo: llenar la columna CONTENIDO con una categoria GENERAL, sin marcas.
-    
-    Reglas:
-    - Prioriza PRODUCTO_DOMINANTE (es el más pesado del envío).
-    - Usa PRODUCTOS_LISTA solo como contexto.
-    - NO menciones marcas (Nike, Apple, etc). Solo categoria general.
-    - 'contenido' debe ser corto (1-4 palabras). Puedes aclarar entre paréntesis sin marcas.
-    - Si es muy variado, usa Miscelaneo.
-    
-    PRODUCTO_DOMINANTE: {producto_dominante}
-    PRODUCTOS_LISTA: {productos_lista}
-    """.strip()
-    
-        resp = client.responses.create(
-            model="gpt-4o-mini",
-            input=prompt,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "clasificar_envio",   # <=64 chars
-                    "schema": CLASIFICAR_ENVIO_SCHEMA,
-                    "strict": True
+        # ✅ ESTE es el JSON Schema REAL (raíz type=object)
+        CLASIFICAR_ENVIO_SCHEMA = {
+            "type": "object",
+            "properties": {
+                "categoria": {"type": "string", "enum": CATEGORIAS},
+                "confianza": {"type": "integer", "minimum": 0, "maximum": 100},
+                "contenido": {
+                    "type": "string",
+                    "description": "Texto corto para CONTENIDO (sin marcas). Ej: 'Calzado (tenis)', 'Celular', 'Ropa'."
                 }
-            }
+            },
+            "required": ["categoria", "confianza", "contenido"],
+            "additionalProperties": False
+        }
+    
+        def gpt_clasificar_envio(client: OpenAI, producto_dominante: str, productos_lista: str) -> dict:
+            prompt = f"""
+        Eres un clasificador de envíos para manifiestos.
+        Objetivo: llenar la columna CONTENIDO con una categoria GENERAL, sin marcas.
+    
+        Reglas:
+        - Prioriza PRODUCTO_DOMINANTE (es el más pesado del envío).
+        - Usa PRODUCTOS_LISTA solo como contexto.
+        - NO menciones marcas (Nike, Apple, etc). Solo categoria general.
+        - 'contenido' debe ser corto (1-4 palabras). Puedes aclarar entre paréntesis sin marcas.
+        - Si es muy variado, usa Miscelaneo.
+    
+        PRODUCTO_DOMINANTE: {producto_dominante}
+        PRODUCTOS_LISTA: {productos_lista}
+        """.strip()
+    
+            resp = client.responses.create(
+                model="gpt-4o-mini",
+                input=prompt,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "clasificar_envio",   # <=64 chars
+                        "schema": CLASIFICAR_ENVIO_SCHEMA,
+                        "strict": True
+                    }
+                }
+            )
+    
+            # ✅ resp.output_text ya es JSON válido
+            return json.loads(resp.output_text)   
+
+        client = get_openai_client()
+    
+        df_concat_copy["CONTENIDO"] = df_concat_copy.get(
+            "CONTENIDO", pd.Series([pd.NA] * len(df_concat_copy))
+        ).astype("string")
+    
+        mask_sin_contenido = df_concat_copy["CONTENIDO"].isna() | (df_concat_copy["CONTENIDO"].str.strip() == "")
+    
+        mask_listo_para_gpt = (
+            mask_sin_contenido
+            & df_concat_copy["PRODUCTO_DOMINANTE"].notna()
+            & (df_concat_copy["PRODUCTO_DOMINANTE"].astype(str).str.strip() != "")
         )
     
-        # ✅ resp.output_text ya es JSON válido
-        return json.loads(resp.output_text)   
+        cache = {}
+    
+        cats, confs, conts = [], [], []
+    
+        for dom, lista in zip(
+            df_concat_copy.loc[mask_listo_para_gpt, "PRODUCTO_DOMINANTE"].astype(str).tolist(),
+            df_concat_copy.loc[mask_listo_para_gpt, "PRODUCTOS_LISTA"].fillna("").astype(str).tolist()
+        ):
+            lista = lista[:3000]  # límite de texto
+            key = (dom, lista)
+    
+            if key in cache:
+                out = cache[key]
+            else:
+                out = gpt_clasificar_envio(client, dom, lista)
+                cache[key] = out
+    
+            cats.append(out["categoria"])
+            confs.append(out["confianza"])
+            conts.append(out["contenido"])
+    
+        df_concat_copy.loc[mask_listo_para_gpt, "CATEGORIA_GPT"] = cats
+        df_concat_copy.loc[mask_listo_para_gpt, "CONF_GPT"] = confs
+        df_concat_copy.loc[mask_listo_para_gpt, "CONTENIDO"] = conts
+    
+        # Si sigue sin match (no había productos), se queda vacío
 
-    client = get_openai_client()
+        # =========================
+        # PASAR CONTENIDO de df_concat_copy -> df_concat (por guia)
+        # =========================
     
-    df_concat_copy["CONTENIDO"] = df_concat_copy.get(
-        "CONTENIDO", pd.Series([pd.NA] * len(df_concat_copy))
-    ).astype("string")
+        # 1) Normalizar llaves (por si acaso)
+        df_concat_copy["guia"] = _clean_str_series(df_concat_copy["guia"])
+        df_concat["guia"] = _clean_str_series(df_concat["guia"])
     
-    mask_sin_contenido = df_concat_copy["CONTENIDO"].isna() | (df_concat_copy["CONTENIDO"].str.strip() == "")
+        # 2) Asegurar CONTENIDO como string
+        df_concat["CONTENIDO"] = df_concat.get("CONTENIDO", pd.Series([pd.NA]*len(df_concat))).astype("string")
+        df_concat_copy["CONTENIDO"] = df_concat_copy.get("CONTENIDO", pd.Series([pd.NA]*len(df_concat_copy))).astype("string")
     
-    mask_listo_para_gpt = (
-        mask_sin_contenido
-        & df_concat_copy["PRODUCTO_DOMINANTE"].notna()
-        & (df_concat_copy["PRODUCTO_DOMINANTE"].astype(str).str.strip() != "")
-    )
+        # 3) Tomar SOLO filas donde df_concat_copy tiene contenido generado (no vacío)
+        mask_copy_con = df_concat_copy["CONTENIDO"].notna() & (df_concat_copy["CONTENIDO"].str.strip() != "")
     
-    cache = {}
+        # Si hay duplicados de guia en copy, me quedo con el último no vacío (por seguridad)
+        df_map = (
+            df_concat_copy.loc[mask_copy_con, ["guia", "CONTENIDO"]]
+            .drop_duplicates(subset=["guia"], keep="last")
+        )
     
-    cats, confs, conts = [], [], []
+        map_contenido = df_map.set_index("guia")["CONTENIDO"].to_dict()
     
-    for dom, lista in zip(
-        df_concat_copy.loc[mask_listo_para_gpt, "PRODUCTO_DOMINANTE"].astype(str).tolist(),
-        df_concat_copy.loc[mask_listo_para_gpt, "PRODUCTOS_LISTA"].fillna("").astype(str).tolist()
-    ):
-        lista = lista[:3000]  # límite de texto
-        key = (dom, lista)
+        # 4) POBLAR en df_concat SOLO donde estaba vacío
+        mask_concat_vacio = df_concat["CONTENIDO"].isna() | (df_concat["CONTENIDO"].str.strip() == "")
     
-        if key in cache:
-            out = cache[key]
-        else:
-            out = gpt_clasificar_envio(client, dom, lista)
-            cache[key] = out
-    
-        cats.append(out["categoria"])
-        confs.append(out["confianza"])
-        conts.append(out["contenido"])
-    
-    df_concat_copy.loc[mask_listo_para_gpt, "CATEGORIA_GPT"] = cats
-    df_concat_copy.loc[mask_listo_para_gpt, "CONF_GPT"] = confs
-    df_concat_copy.loc[mask_listo_para_gpt, "CONTENIDO"] = conts
-    
-    # Si sigue sin match (no había productos), se queda vacío
-
-    # =========================
-    # PASAR CONTENIDO de df_concat_copy -> df_concat (por guia)
-    # =========================
-    
-    # 1) Normalizar llaves (por si acaso)
-    df_concat_copy["guia"] = _clean_str_series(df_concat_copy["guia"])
-    df_concat["guia"] = _clean_str_series(df_concat["guia"])
-    
-    # 2) Asegurar CONTENIDO como string
-    df_concat["CONTENIDO"] = df_concat.get("CONTENIDO", pd.Series([pd.NA]*len(df_concat))).astype("string")
-    df_concat_copy["CONTENIDO"] = df_concat_copy.get("CONTENIDO", pd.Series([pd.NA]*len(df_concat_copy))).astype("string")
-    
-    # 3) Tomar SOLO filas donde df_concat_copy tiene contenido generado (no vacío)
-    mask_copy_con = df_concat_copy["CONTENIDO"].notna() & (df_concat_copy["CONTENIDO"].str.strip() != "")
-    
-    # Si hay duplicados de guia en copy, me quedo con el último no vacío (por seguridad)
-    df_map = (
-        df_concat_copy.loc[mask_copy_con, ["guia", "CONTENIDO"]]
-        .drop_duplicates(subset=["guia"], keep="last")
-    )
-    
-    map_contenido = df_map.set_index("guia")["CONTENIDO"].to_dict()
-    
-    # 4) POBLAR en df_concat SOLO donde estaba vacío
-    mask_concat_vacio = df_concat["CONTENIDO"].isna() | (df_concat["CONTENIDO"].str.strip() == "")
-    
-    df_concat.loc[mask_concat_vacio, "CONTENIDO"] = df_concat.loc[mask_concat_vacio, "guia"].map(map_contenido)
+        df_concat.loc[mask_concat_vacio, "CONTENIDO"] = df_concat.loc[mask_concat_vacio, "guia"].map(map_contenido)
         
  
     
 
-    resumen_manifiestos = [
-        f"Nuevo 11591={nuevo_man_11591}",
-        f"Otros={nuevo_man_otros}",
-    ]
-    if nuevo_man_contingencia is not None:
-        resumen_manifiestos.insert(0, f"Contingencia={nuevo_man_contingencia}")
+        resumen_manifiestos = [
+            f"Nuevo 11591={nuevo_man_11591}",
+            f"Otros={nuevo_man_otros}",
+        ]
+        if nuevo_man_contingencia is not None:
+            resumen_manifiestos.insert(0, f"Contingencia={nuevo_man_contingencia}")
 
-    st.success(f"Manifiestos asignados. {' | '.join(resumen_manifiestos)}")
+        st.success(f"Manifiestos asignados. {' | '.join(resumen_manifiestos)}")
 
-    # -----------------------------
-    # 12) Subir histórico actualizado (overwrite) a Dropbox
-    # -----------------------------
-    guias_contingencia_reales = {
-        _normalize_excel_key(guia)
-        for guia in df_concat.loc[df_concat["CONTINGENCIA_REAL"].fillna(False), "guia"].tolist()
-        if _normalize_excel_key(guia)
-    }
+        # -----------------------------
+        # 12) Subir histórico actualizado (overwrite) a Dropbox
+        # -----------------------------
+        guias_contingencia_reales = {
+            _normalize_excel_key(guia)
+            for guia in df_concat.loc[df_concat["CONTINGENCIA_REAL"].fillna(False), "guia"].tolist()
+            if _normalize_excel_key(guia)
+        }
 
-    excel_bytes = dfs_to_excel_bytes(
-        {
-            "HISTORICO": df_concat,
-            "costo por manifiesto": df_costos_manifiesto,
-        },
-        highlight_rows={
-            "HISTORICO": {"guia_col": "guia", "guias": guias_contingencia_reales},
-        },
-        hidden_columns={
-            "HISTORICO": ["CONTINGENCIA_REAL"],
-        },
-    )
-    
-    dbx.files_upload(excel_bytes, DBX_FILE_PATH, mode=dropbox.files.WriteMode.overwrite)
-
-    st.success("Histórico actualizado en Dropbox (reemplazado) ✅")
-
-    # (opcional) mostrar muestra
-    with st.expander("Ver muestra del histórico resultante"):
-        st.dataframe(df_concat.drop(columns=["CONTINGENCIA_REAL"], errors="ignore").head(100))
-    st.session_state["df_concat"] = df_concat
-    st.session_state["fecha_str"] = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-        
-        
-        
-        
-import zipfile
-
-st.divider()
-st.subheader("Descargas por manifiesto")
-
-if "df_concat" not in st.session_state:
-    st.info("Primero ejecuta: **Procesar y actualizar histórico en Dropbox** para habilitar descargas.")
-else:
-    df_concat = st.session_state["df_concat"]
-    fecha_str = st.session_state.get("fecha_str") or datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-
-    # -----------------------------
-    # Vista SOLO para descargas (no afecta Dropbox)
-    # - omite CASILLERO
-    # - ordena columnas
-    # - renombra guia -> GUIA
-    # -----------------------------
-    guias_contingencia_reales = {
-        _normalize_excel_key(guia)
-        for guia in df_concat.loc[df_concat["CONTINGENCIA_REAL"].fillna(False), "guia"].tolist()
-        if _normalize_excel_key(guia)
-    }
-
-    df_dl = df_concat.copy()
-    df_dl = df_dl.drop(columns=["CASILLERO","VALOR","CONTINGENCIA_REAL"], errors="ignore")
-
-    if "guia" in df_dl.columns:
-        df_dl = df_dl.rename(columns={"guia": "GUIA"})
-
-    orden_descarga = [
-        "FECHA GUIA",
-        "GUIA",
-        "COMPAÑÍA REMITENTE",
-        "REMITENTE DIRECCION",
-        "REMITENTE TELEFONO",
-        "REMITENTE CIUDAD",
-        "REMITENTE ESTADO",
-        "NOMBRE DESTINO",
-        "DESTINO DIRECCION",
-        "DESTINO TELEFONO",
-        "DESTINO CIUDAD",
-        "CONTENIDO",
-        "PESO LIBRAS",
-        "PESO KILOS",
-        "VALOR DECLARADO",
-        "PIEZAS",
-        "DESTINO ESTADO",
-        "POSICION ARANCELARIA",
-        "MANIFIESTO",
-        "INSTRUCCIONES"
-    ]
-
-    presentes = [c for c in orden_descarga if c in df_dl.columns]
-    extras = [c for c in df_dl.columns if c not in presentes]
-    df_dl = df_dl[presentes + extras]
-
-    # Lista de manifiestos disponibles (ordenados, sin nulos)
-    if "MANIFIESTO" not in df_dl.columns:
-        st.warning("No existe la columna MANIFIESTO en el histórico para descargas.")
-    else:
-        manifiestos = (
-            df_dl["MANIFIESTO"]
-            .dropna()
-            .astype("int64")
-            .sort_values()
-            .unique()
-            .tolist()
+        excel_bytes = dfs_to_excel_bytes(
+            {
+                "HISTORICO": df_concat,
+                "costo por manifiesto": df_costos_manifiesto,
+            },
+            highlight_rows={
+                "HISTORICO": {"guia_col": "guia", "guias": guias_contingencia_reales},
+            },
+            hidden_columns={
+                "HISTORICO": ["CONTINGENCIA_REAL"],
+            },
         )
+    
+        dbx.files_upload(excel_bytes, DBX_FILE_PATH, mode=dropbox.files.WriteMode.overwrite)
 
+        st.success("Histórico actualizado en Dropbox (reemplazado) ✅")
 
-        def resumen_costo_por_manifiesto(df: pd.DataFrame) -> pd.DataFrame:
-            """
-            Suma PESO LIBRAS, PESO KILOS, PIEZAS, COSTO por MANIFIESTO (solo para el df recibido).
-            """
-            df2 = df.copy()
+        # (opcional) mostrar muestra
+        with st.expander("Ver muestra del histórico resultante"):
+            st.dataframe(df_concat.drop(columns=["CONTINGENCIA_REAL"], errors="ignore").head(100))
+        st.session_state["df_concat"] = df_concat
+        st.session_state["fecha_str"] = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
         
-            for col in ["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]:
-                if col in df2.columns:
-                    df2[col] = pd.to_numeric(df2[col], errors="coerce")
         
-            if "MANIFIESTO" not in df2.columns:
-                return pd.DataFrame(columns=["MANIFIESTO", "PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"])
         
-            out = (
-                df2
-                .groupby("MANIFIESTO", as_index=False)[["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]]
-                .sum(min_count=1)
+        
+    import zipfile
+
+    st.divider()
+    st.subheader("Descargas por manifiesto")
+
+    if "df_concat" not in st.session_state:
+        st.info("Primero ejecuta: **Procesar y actualizar histórico en Dropbox** para habilitar descargas.")
+    else:
+        df_concat = st.session_state["df_concat"]
+        fecha_str = st.session_state.get("fecha_str") or datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+
+        # -----------------------------
+        # Vista SOLO para descargas (no afecta Dropbox)
+        # - omite CASILLERO
+        # - ordena columnas
+        # - renombra guia -> GUIA
+        # -----------------------------
+        guias_contingencia_reales = {
+            _normalize_excel_key(guia)
+            for guia in df_concat.loc[df_concat["CONTINGENCIA_REAL"].fillna(False), "guia"].tolist()
+            if _normalize_excel_key(guia)
+        }
+
+        df_dl = df_concat.copy()
+        df_dl = df_dl.drop(columns=["CASILLERO","VALOR","CONTINGENCIA_REAL"], errors="ignore")
+
+        if "guia" in df_dl.columns:
+            df_dl = df_dl.rename(columns={"guia": "GUIA"})
+
+        orden_descarga = [
+            "FECHA GUIA",
+            "GUIA",
+            "COMPAÑÍA REMITENTE",
+            "REMITENTE DIRECCION",
+            "REMITENTE TELEFONO",
+            "REMITENTE CIUDAD",
+            "REMITENTE ESTADO",
+            "NOMBRE DESTINO",
+            "DESTINO DIRECCION",
+            "DESTINO TELEFONO",
+            "DESTINO CIUDAD",
+            "CONTENIDO",
+            "PESO LIBRAS",
+            "PESO KILOS",
+            "VALOR DECLARADO",
+            "PIEZAS",
+            "DESTINO ESTADO",
+            "POSICION ARANCELARIA",
+            "MANIFIESTO",
+            "INSTRUCCIONES"
+        ]
+
+        presentes = [c for c in orden_descarga if c in df_dl.columns]
+        extras = [c for c in df_dl.columns if c not in presentes]
+        df_dl = df_dl[presentes + extras]
+
+        # Lista de manifiestos disponibles (ordenados, sin nulos)
+        if "MANIFIESTO" not in df_dl.columns:
+            st.warning("No existe la columna MANIFIESTO en el histórico para descargas.")
+        else:
+            manifiestos = (
+                df_dl["MANIFIESTO"]
+                .dropna()
+                .astype("int64")
+                .sort_values()
+                .unique()
+                .tolist()
             )
-            return out
+
+
+            def resumen_costo_por_manifiesto(df: pd.DataFrame) -> pd.DataFrame:
+                """
+                Suma PESO LIBRAS, PESO KILOS, PIEZAS, COSTO por MANIFIESTO (solo para el df recibido).
+                """
+                df2 = df.copy()
+        
+                for col in ["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]:
+                    if col in df2.columns:
+                        df2[col] = pd.to_numeric(df2[col], errors="coerce")
+        
+                if "MANIFIESTO" not in df2.columns:
+                    return pd.DataFrame(columns=["MANIFIESTO", "PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"])
+        
+                out = (
+                    df2
+                    .groupby("MANIFIESTO", as_index=False)[["PESO LIBRAS", "PESO KILOS", "PIEZAS", "COSTO"]]
+                    .sum(min_count=1)
+                )
+                return out
         
         
-        def build_zip_all_manifiestos(df_all: pd.DataFrame) -> bytes:
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for man in (
-                    df_all["MANIFIESTO"].dropna().astype("int64").sort_values().unique().tolist()
-                ):
-                    df_m = df_all[df_all["MANIFIESTO"].astype("Int64") == man].copy()
+            def build_zip_all_manifiestos(df_all: pd.DataFrame) -> bytes:
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for man in (
+                        df_all["MANIFIESTO"].dropna().astype("int64").sort_values().unique().tolist()
+                    ):
+                        df_m = df_all[df_all["MANIFIESTO"].astype("Int64") == man].copy()
         
-                    df_costos_m = resumen_costo_por_manifiesto(df_m)
+                        df_costos_m = resumen_costo_por_manifiesto(df_m)
         
-                    guias_rojas_man = {
+                        guias_rojas_man = {
+                            _normalize_excel_key(guia)
+                            for guia in df_m.get("GUIA", pd.Series(dtype="string")).tolist()
+                            if _normalize_excel_key(guia) in guias_contingencia_reales
+                        }
+
+                        excel_bytes = dfs_to_excel_bytes(
+                            {
+                                f"MAN_{man}": df_m,
+                                "costo por manifiesto": df_costos_m,
+                            },
+                            highlight_rows={
+                                f"MAN_{man}": {"guia_col": "GUIA", "guias": guias_rojas_man},
+                            },
+                        )
+        
+                        filename = f"{fecha_str}-{man}.xlsx"
+                        zf.writestr(filename, excel_bytes)
+        
+                zip_buf.seek(0)
+                return zip_buf.getvalue()
+        
+        
+            col_all, col_one = st.columns([1, 1])
+        
+            with col_all:
+                st.markdown("**Descargar todos (ZIP)**")
+                if st.button("Preparar ZIP con todos los manifiestos"):
+                    zip_bytes = build_zip_all_manifiestos(df_dl)
+                    st.download_button(
+                        "Descargar ZIP",
+                        data=zip_bytes,
+                        file_name=f"{fecha_str}-manifiestos.zip",
+                        mime="application/zip",
+                    )
+        
+            with col_one:
+                st.markdown("**Descargar uno puntual**")
+                if not manifiestos:
+                    st.info("No hay manifiestos disponibles para descargar.")
+                else:
+                    man_sel = st.selectbox("Buscar/seleccionar manifiesto", options=manifiestos)
+        
+                    df_sel = df_dl[df_dl["MANIFIESTO"].astype("Int64") == int(man_sel)].copy()
+                    df_costos_sel = resumen_costo_por_manifiesto(df_sel)
+        
+                    guias_rojas_sel = {
                         _normalize_excel_key(guia)
-                        for guia in df_m.get("GUIA", pd.Series(dtype="string")).tolist()
+                        for guia in df_sel.get("GUIA", pd.Series(dtype="string")).tolist()
                         if _normalize_excel_key(guia) in guias_contingencia_reales
                     }
 
-                    excel_bytes = dfs_to_excel_bytes(
+                    excel_sel = dfs_to_excel_bytes(
                         {
-                            f"MAN_{man}": df_m,
-                            "costo por manifiesto": df_costos_m,
+                            f"MAN_{man_sel}": df_sel,
+                            "costo por manifiesto": df_costos_sel,
                         },
                         highlight_rows={
-                            f"MAN_{man}": {"guia_col": "GUIA", "guias": guias_rojas_man},
+                            f"MAN_{man_sel}": {"guia_col": "GUIA", "guias": guias_rojas_sel},
                         },
                     )
         
-                    filename = f"{fecha_str}-{man}.xlsx"
-                    zf.writestr(filename, excel_bytes)
-        
-            zip_buf.seek(0)
-            return zip_buf.getvalue()
-        
-        
-        col_all, col_one = st.columns([1, 1])
-        
-        with col_all:
-            st.markdown("**Descargar todos (ZIP)**")
-            if st.button("Preparar ZIP con todos los manifiestos"):
-                zip_bytes = build_zip_all_manifiestos(df_dl)
-                st.download_button(
-                    "Descargar ZIP",
-                    data=zip_bytes,
-                    file_name=f"{fecha_str}-manifiestos.zip",
-                    mime="application/zip",
-                )
-        
-        with col_one:
-            st.markdown("**Descargar uno puntual**")
-            if not manifiestos:
-                st.info("No hay manifiestos disponibles para descargar.")
-            else:
-                man_sel = st.selectbox("Buscar/seleccionar manifiesto", options=manifiestos)
-        
-                df_sel = df_dl[df_dl["MANIFIESTO"].astype("Int64") == int(man_sel)].copy()
-                df_costos_sel = resumen_costo_por_manifiesto(df_sel)
-        
-                guias_rojas_sel = {
-                    _normalize_excel_key(guia)
-                    for guia in df_sel.get("GUIA", pd.Series(dtype="string")).tolist()
-                    if _normalize_excel_key(guia) in guias_contingencia_reales
-                }
+                    st.download_button(
+                        f"Descargar {fecha_str}-{man_sel}.xlsx",
+                        data=excel_sel,
+                        file_name=f"{fecha_str}-{man_sel}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
 
-                excel_sel = dfs_to_excel_bytes(
-                    {
-                        f"MAN_{man_sel}": df_sel,
-                        "costo por manifiesto": df_costos_sel,
-                    },
-                    highlight_rows={
-                        f"MAN_{man_sel}": {"guia_col": "GUIA", "guias": guias_rojas_sel},
-                    },
-                )
-        
-                st.download_button(
-                    f"Descargar {fecha_str}-{man_sel}.xlsx",
-                    data=excel_sel,
-                    file_name=f"{fecha_str}-{man_sel}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+elif modo == "Celulares Fénix":
+    st.subheader("Celulares Fénix")
+
+    fx_col1, fx_col2, fx_col3 = st.columns(3)
+    with fx_col1:
+        up_a_fx = st.file_uploader("A — Pistoleo Fénix (.xlsx)", type=["xlsx", "xls"], key="up_a_fx")
+    with fx_col2:
+        up_b_fx = st.file_uploader("B — Envíos Encargomio (.xlsx)", type=["xlsx", "xls"], key="up_b_fx")
+    with fx_col3:
+        up_p_fx = st.file_uploader("P — Productos por casillero (.xlsx)", type=["xlsx", "xls"], key="up_p_fx")
+
+    run_fx = st.button("Procesar Celulares Fénix")
+
+    if run_fx:
+        # a) Validar que los 3 archivos estén cargados
+        if not (up_a_fx and up_b_fx and up_p_fx):
+            st.warning("Sube los 3 archivos (A Pistoleo Fénix, B Envíos Encargomio y P Productos) para continuar.")
+            st.stop()
+
+        # b) Leer los 3 archivos
+        df_a_fx = pd.read_excel(up_a_fx)
+        df_b_fx = pd.read_excel(up_b_fx)
+        df_p_fx = pd.read_excel(up_p_fx)
+
+        # c) Limpiar llaves con la función global _clean_str_series
+        df_a_fx["Guias fenix"] = _clean_str_series(df_a_fx["Guias fenix"])
+        df_b_fx["GUIA INTERNACIONAL"] = _clean_str_series(df_b_fx["GUIA INTERNACIONAL"])
+        df_b_fx["NUMERO ENVIO"] = _clean_str_series(df_b_fx["NUMERO ENVIO"])
+        df_p_fx["Envío"] = _clean_str_series(df_p_fx["Envío"])
+
+        # d) Deduplicar A por guía (manda lo pistoleado)
+        df_a_fx = df_a_fx.drop_duplicates(subset=["Guias fenix"])
+
+        # e) CRUCE 1: A ⟕ B por guía (how="left": manda lo pistoleado)
+        df_ab = df_a_fx.merge(
+            df_b_fx,
+            how="left",
+            left_on="Guias fenix",
+            right_on="GUIA INTERNACIONAL",
+        )
+
+        # f) Guías pistoleadas sin match en B (informativo, no detiene)
+        mask_sin_match_fx = df_ab["NUMERO ENVIO"].isna()
+        guias_sin_match_fx = (
+            df_ab.loc[mask_sin_match_fx, "Guias fenix"].dropna().astype(str).tolist()
+        )
+        if guias_sin_match_fx:
+            st.warning(
+                "Guías pistoleadas sin match en Envíos: "
+                + ", ".join(guias_sin_match_fx)
+            )
+
+        # g) CRUCE 2: con P por envío (la guía de Fénix cruza contra "Envío" de P)
+        df_full = df_ab.merge(
+            df_p_fx,
+            how="left",
+            left_on="Guias fenix",
+            right_on="Envío",
+        )
+
+        # h) Guardar y verificación visual temporal
+        st.session_state["df_fenix"] = df_full
+
+        total_pistoleadas_fx = df_a_fx["Guias fenix"].nunique()
+        total_con_b_fx = (~mask_sin_match_fx).sum()
+        total_filas_producto_fx = len(df_full)
+
+        st.success(
+            f"Pistoleadas: {total_pistoleadas_fx} | "
+            f"Cruzaron con B: {total_con_b_fx} | "
+            f"Filas de producto resultantes: {total_filas_producto_fx}"
+        )
+        st.dataframe(df_full.head(50), use_container_width=True)
+
+        # -----------------------------
+        # 1) Renombrado de B (replica Luma, pero informativo: no st.stop)
+        # -----------------------------
+        rename_map = {
+            "CLIENTE DESTINO": "NOMBRE DESTINO",
+            "CIUDAD DESTINO": "DESTINO CIUDAD",
+            "DEPARTAMENTO DESTINO": "DESTINO ESTADO",
+        }
+        alias_cols = {
+            "DIRECCIÓN DESTINO": "DESTINO DIRECCION",
+            "DIRECCIÃ“N DESTINO": "DESTINO DIRECCION",
+            "TELÉFONO": "DESTINO TELEFONO",
+            "TELÃ‰FONO": "DESTINO TELEFONO",
+        }
+
+        for src, dst in alias_cols.items():
+            if src in df_full.columns:
+                df_full = df_full.rename(columns={src: dst})
+
+        faltantes_fx = [c for c in rename_map.keys() if c not in df_full.columns]
+        if faltantes_fx:
+            st.warning(f"Columnas de destinatario ausentes en B (se crean vacías): {faltantes_fx}")
+
+        df_full = df_full.rename(columns=rename_map)
+
+        # 2) Columna guia (la guía de Fénix es la llave de salida)
+        df_full["guia"] = df_full["Guias fenix"]
+
+        # 3) Columnas calculadas (replica Luma, sin POSICION ARANCELARIA ni COSTO)
+        df_full["PIEZAS"] = 1
+        df_full["VALOR DECLARADO"] = np.random.randint(91, 100, size=len(df_full))
+        df_full["PESO LIBRAS"] = pd.to_numeric(df_full["PESO LIBRAS"], errors="coerce")
+        df_full["PESO KILOS"] = df_full["PESO LIBRAS"] / 2.2
+        hoy_miami = datetime.now(ZoneInfo("America/New_York")).date()
+        df_full["FECHA GUIA"] = pd.to_datetime(hoy_miami)
+
+        # 4) CONTENIDO fijo (sin IA)
+        df_full["CONTENIDO"] = "Celulares"
+
+        # 5) Agregación a una fila por guía (productos concatenados)
+        productos_por_guia = (
+            df_full.dropna(subset=["Nombre producto"])
+            .groupby("guia")["Nombre producto"]
+            .apply(lambda s: " | ".join(s.astype(str).unique()))
+            .rename("PRODUCTOS")
+        )
+
+        df_guia = df_full.drop_duplicates(subset=["guia"], keep="first").copy()
+        df_guia = df_guia.merge(productos_por_guia, how="left", on="guia")
+
+        # 6) Esquema final de salida (crea vacías las que falten)
+        cols_salida_fx = [
+            "FECHA GUIA", "guia", "NOMBRE DESTINO", "DESTINO DIRECCION",
+            "DESTINO TELEFONO", "DESTINO CIUDAD", "DESTINO ESTADO", "CONTENIDO",
+            "PRODUCTOS", "PESO LIBRAS", "PESO KILOS", "VALOR DECLARADO", "PIEZAS",
+        ]
+        for c in cols_salida_fx:
+            if c not in df_guia.columns:
+                df_guia[c] = pd.NA
+        df_salida_fx = df_guia[cols_salida_fx].copy()
+
+        # 7) Resumen agregado
+        total_guias_fx = df_salida_fx["guia"].nunique()
+        total_piezas_fx = pd.to_numeric(df_salida_fx["PIEZAS"], errors="coerce").sum()
+        total_libras_fx = pd.to_numeric(df_salida_fx["PESO LIBRAS"], errors="coerce").sum()
+        total_kilos_fx = pd.to_numeric(df_salida_fx["PESO KILOS"], errors="coerce").sum()
+
+        guias_por_ciudad_fx = (
+            df_salida_fx.groupby("DESTINO CIUDAD", dropna=False)["guia"]
+            .nunique()
+            .reset_index(name="GUIAS")
+            .sort_values("GUIAS", ascending=False)
+        )
+
+        # 8) Pantalla: detalle
+        st.subheader("Detalle Celulares")
+        st.dataframe(df_salida_fx, use_container_width=True)
+
+        st.markdown("### Resumen Celulares Fénix")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Guías (envíos)", int(total_guias_fx))
+        m2.metric("Piezas", int(total_piezas_fx))
+        m3.metric("Peso libras", round(float(total_libras_fx), 2))
+        m4.metric("Peso kilos", round(float(total_kilos_fx), 2))
+
+        st.markdown("**Guías por ciudad**")
+        st.dataframe(guias_por_ciudad_fx, use_container_width=True)
+
+        # 9) Descarga Excel (reusa la función global dfs_to_excel_bytes)
+        excel_fx = dfs_to_excel_bytes({
+            "CELULARES": df_salida_fx,
+            "RESUMEN": guias_por_ciudad_fx,
+        })
+        st.download_button(
+            label="Descargar Excel Celulares Fénix",
+            data=excel_fx,
+            file_name=f"celulares_fenix_{datetime.now(ZoneInfo('America/New_York')).date()}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        # 10) Guardar para el siguiente paso (Dropbox)
+        st.session_state["df_salida_fx"] = df_salida_fx
+
+        # -----------------------------
+        # 11) Persistir histórico Fénix en Dropbox (archivo SEPARADO del de Luma)
+        # -----------------------------
+        st.caption(
+            "El histórico de Celulares Fénix se guarda en un archivo aparte del de Luma. "
+            "Esta acción SOBREESCRIBE ese archivo de histórico Fénix en Dropbox."
+        )
+
+        # Ruta local (no global) del histórico Fénix; NO se toca DBX_FILE_PATH de Luma
+        DBX_FILE_PATH_FENIX = "/Manifiestos/Celulares_fenix.xlsx"
+
+        def load_historico_fenix(dbx, path):
+            try:
+                _, res = dbx.files_download(path)
+                return pd.read_excel(io.BytesIO(res.content), sheet_name=0)
+            except dropbox.exceptions.ApiError:
+                return pd.DataFrame(columns=df_salida_fx.columns)
+
+        dbx_fx = get_dbx()
+        hist_fx = load_historico_fenix(dbx_fx, DBX_FILE_PATH_FENIX)
+
+        # Normalizar llave "guia" en ambos (por .0 / espacios) con la global
+        if "guia" in hist_fx.columns and not hist_fx.empty:
+            hist_fx["guia"] = _clean_str_series(hist_fx["guia"])
+        df_salida_fx["guia"] = _clean_str_series(df_salida_fx["guia"])
+
+        # Concatenar y deduplicar conservando lo VIEJO (histórico manda)
+        df_hist_fx = pd.concat([hist_fx, df_salida_fx], ignore_index=True)
+        df_hist_fx = df_hist_fx.drop_duplicates(subset=["guia"], keep="first")
+
+        # Generar Excel del histórico con la global
+        excel_hist_fx = dfs_to_excel_bytes({"HISTORICO": df_hist_fx})
+
+        # Subir a Dropbox sobreescribiendo (mismo patrón que Luma), con manejo de error
+        try:
+            dbx_fx.files_upload(
+                excel_hist_fx,
+                DBX_FILE_PATH_FENIX,
+                mode=dropbox.files.WriteMode.overwrite,
+            )
+            st.success(
+                f"Histórico Fénix actualizado en Dropbox: {len(df_hist_fx)} guías acumuladas "
+                f"({DBX_FILE_PATH_FENIX})."
+            )
+        except Exception as e:
+            st.error(f"No se pudo actualizar el histórico Fénix en Dropbox: {e}")
