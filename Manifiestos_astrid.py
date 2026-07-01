@@ -481,7 +481,7 @@ def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.
     df_final["VALOR DECLARADO"] = np.random.randint(91, 100, size=len(df_final))
     df_final["POSICION ARANCELARIA"] = "980720"
     df_final["PESO LIBRAS"] = pd.to_numeric(df_final["PESO LIBRAS"], errors="coerce")
-    df_final["PESO KILOS"] = df_final["PESO LIBRAS"] / 2.2
+    df_final["PESO KILOS"] = df_final["PESO LIBRAS"] / 2.20462
     df_final["FECHA GUIA"] = pd.to_datetime(datetime.now(ZoneInfo("America/New_York")).date())
     if "CONTENIDO" not in df_final.columns:
         df_final["CONTENIDO"] = pd.NA
@@ -771,7 +771,7 @@ if modo == "Manifiestos Luma":
         # 9) PESO KILOS + FECHA GUIA Miami
         # -----------------------------
         df_final["PESO LIBRAS"] = pd.to_numeric(df_final["PESO LIBRAS"], errors="coerce")
-        df_final["PESO KILOS"] = df_final["PESO LIBRAS"] / 2.2
+        df_final["PESO KILOS"] = df_final["PESO LIBRAS"] / 2.20462
 
         hoy_miami = datetime.now(ZoneInfo("America/New_York")).date()
         df_final["FECHA GUIA"] = pd.to_datetime(hoy_miami)
@@ -1502,7 +1502,7 @@ elif modo == "Celulares Fénix":
         df_full["PIEZAS"] = 1
         df_full["VALOR DECLARADO"] = np.random.randint(91, 100, size=len(df_full))
         df_full["PESO LIBRAS"] = pd.to_numeric(df_full["PESO LIBRAS"], errors="coerce")
-        df_full["PESO KILOS"] = df_full["PESO LIBRAS"] / 2.2
+        df_full["PESO KILOS"] = df_full["PESO LIBRAS"] / 2.20462
         hoy_miami = datetime.now(ZoneInfo("America/New_York")).date()
         df_full["FECHA GUIA"] = pd.to_datetime(hoy_miami)
 
