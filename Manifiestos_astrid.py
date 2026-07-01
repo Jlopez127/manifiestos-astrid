@@ -486,6 +486,15 @@ def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.
     if "CONTENIDO" not in df_final.columns:
         df_final["CONTENIDO"] = pd.NA
 
+    # Guías pistoleadas sin cruce en B / sin peso válido (informativo, no bloquea)
+    _peso_new = df_final["PESO LIBRAS"]
+    guias_sin_peso = (
+        df_final.loc[_peso_new.isna() | (_peso_new <= 0), "guia"]
+        .dropna()
+        .astype(str)
+        .tolist()
+    )
+
     hist = hist.copy() if hist is not None else pd.DataFrame()
     if "guia" not in hist.columns and "GUIA" in hist.columns:
         hist = hist.rename(columns={"GUIA": "guia"})
@@ -510,7 +519,7 @@ def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.
         except Exception:
             n_ia = -1
 
-    return df_concat, int(nuevo), n_ia
+    return df_concat, int(nuevo), n_ia, guias_sin_peso
 
 
 # -----------------------------
@@ -1701,7 +1710,7 @@ elif modo == "Envios Encargomio":
         df_b_ee = pd.read_excel(up_b_ee)
         df_p_ee = pd.read_excel(up_p_ee) if up_p_ee is not None else None
 
-        df_concat_ee, nuevo_man, n_ia = procesar_envios_encargomio(
+        df_concat_ee, nuevo_man, n_ia, guias_sin_peso = procesar_envios_encargomio(
             df_a_ee, df_b_ee, hist_ee, df_p_ee
         )
 
@@ -1719,6 +1728,13 @@ elif modo == "Envios Encargomio":
             f"Histórico Envios Encargomio actualizado ({len(df_concat_ee)} filas). "
             f"Nuevo manifiesto: {nuevo_man}. {msg_ia}."
         )
+
+        if guias_sin_peso:
+            st.warning(
+                f"⚠ {len(guias_sin_peso)} guía(s) pistoleadas SIN cruce en Envíos Encargomio "
+                f"o con peso inválido. Entran al histórico con peso vacío; revísalas: "
+                + ", ".join(guias_sin_peso)
+            )
 
     if "hist_ee" not in st.session_state:
         if st.button("Cargar histórico Envios Encargomio (solo descargar)"):
