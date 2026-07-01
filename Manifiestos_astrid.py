@@ -240,13 +240,287 @@ def dfs_to_excel_bytes(
 
 
 # -----------------------------
+# Formato INFO MANIFIESTO (Envios Encargomio / cajas)
+# -----------------------------
+INFO_MANIFIESTO_COLS = [
+    "MASTER", "FECHA GUIA", "GUIA / consignment", "COMPAÑÍA REMITENTE",
+    "REMITENTE DIRECCION", "REMITENTE CIUDAD", "REMITENTE ESTADO",
+    "NOMBRE DESTINO", "DESTINO DIRECCION", "DESTINO CIUDAD", "CONTENIDO",
+    "PESO LIBRAS", "PESO KILOS", "VALOR DECLARADO", "PIEZAS",
+    "DESTINO ESTADO", "POSICION ARANCELARIA", "MANIFIESTO",
+]
+
+
+def build_info_manifiesto_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Reordena/renombra un manifiesto al formato INFO MANIFIESTO (cajas).
+    MASTER queda vacía y 'guia' pasa a 'GUIA / consignment'."""
+    d = df.copy()
+    if "GUIA / consignment" not in d.columns:
+        if "guia" in d.columns:
+            d = d.rename(columns={"guia": "GUIA / consignment"})
+        elif "GUIA" in d.columns:
+            d = d.rename(columns={"GUIA": "GUIA / consignment"})
+    d["MASTER"] = ""
+    for c in INFO_MANIFIESTO_COLS:
+        if c not in d.columns:
+            d[c] = pd.NA
+    return d[INFO_MANIFIESTO_COLS].copy()
+
+
+def info_manifiesto_excel_bytes(df_info: pd.DataFrame) -> bytes:
+    """Escribe el formato INFO MANIFIESTO y agrega el pie de TOTALES
+    (W.Lb, W.Kg, Value, Pieces) igual que la hoja 'CAJAS ENCARGOMIO'."""
+    def _sum(col):
+        return round(float(pd.to_numeric(df_info[col], errors="coerce").sum()), 2)
+
+    tot_lb = _sum("PESO LIBRAS")
+    tot_kg = _sum("PESO KILOS")
+    tot_val = _sum("VALOR DECLARADO")
+    tot_pz = int(pd.to_numeric(df_info["PIEZAS"], errors="coerce").sum())
+    idx = {name: i + 1 for i, name in enumerate(INFO_MANIFIESTO_COLS)}
+
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df_info.to_excel(writer, sheet_name="INFO MANIFIESTO", index=False)
+        ws = writer.sheets["INFO MANIFIESTO"]
+
+        r = ws.max_row + 2          # fila de valores (deja una en blanco tras los datos)
+        lab = r + 1                 # fila de leyenda
+        ws.cell(r, idx["PESO LIBRAS"]).value = tot_lb
+        ws.cell(r, idx["PESO KILOS"]).value = tot_kg
+        ws.cell(r, idx["VALOR DECLARADO"]).value = tot_val
+        ws.cell(r, idx["PIEZAS"]).value = tot_pz
+
+        ws.cell(lab, idx["MASTER"]).value = "TOTAL:"
+        ws.cell(lab, idx["DESTINO CIUDAD"]).value = "Volume Vlb:0"
+        ws.cell(lab, idx["PESO LIBRAS"]).value = "W.Lb"
+        ws.cell(lab, idx["PESO KILOS"]).value = "W.Kg:"
+        ws.cell(lab, idx["VALOR DECLARADO"]).value = "Value:$"
+        ws.cell(lab, idx["PIEZAS"]).value = "Pieces:"
+
+        for cell in ws[r]:
+            cell.font = Font(bold=True)
+        for cell in ws[lab]:
+            cell.font = Font(bold=True)
+    out.seek(0)
+    return out.getvalue()
+
+
+# -----------------------------
+# Clasificación CONTENIDO por IA (OpenAI) — usada por Envios Encargomio
+# (Manifiestos Luma define su propia copia local; esta es a nivel de módulo)
+# -----------------------------
+CATEGORIAS_IA = [
+    "Tenis", "Calzado", "Celular", "Computador", "Componente de computador",
+    "Ropa", "Perfumes", "Cosmeticos", "Accesorios", "Reloj/Joyeria",
+    "Hogar", "Electrodomestico", "Juguetes", "Herramientas",
+    "Suplementos", "Medicamentos", "Alimentos",
+    "Libros/Papeleria", "Miscelaneo",
+]
+
+CLASIFICAR_ENVIO_SCHEMA_IA = {
+    "type": "object",
+    "properties": {
+        "categoria": {"type": "string", "enum": CATEGORIAS_IA},
+        "confianza": {"type": "integer", "minimum": 0, "maximum": 100},
+        "contenido": {
+            "type": "string",
+            "description": "Texto corto para CONTENIDO (sin marcas). Ej: 'Calzado (tenis)', 'Celular', 'Ropa'.",
+        },
+    },
+    "required": ["categoria", "confianza", "contenido"],
+    "additionalProperties": False,
+}
+
+
+def get_openai_client_mod() -> OpenAI:
+    return OpenAI(api_key=st.secrets["openai"]["api_key"])
+
+
+def gpt_clasificar_envio_mod(client: OpenAI, producto_dominante: str, productos_lista: str) -> dict:
+    prompt = f"""
+Eres un clasificador de envíos para manifiestos.
+Objetivo: llenar la columna CONTENIDO con una categoria GENERAL, sin marcas.
+
+Reglas:
+- Prioriza PRODUCTO_DOMINANTE (es el más pesado del envío).
+- Usa PRODUCTOS_LISTA solo como contexto.
+- NO menciones marcas (Nike, Apple, etc). Solo categoria general.
+- 'contenido' debe ser corto (1-4 palabras). Puedes aclarar entre paréntesis sin marcas.
+- Si es muy variado, usa Miscelaneo.
+
+PRODUCTO_DOMINANTE: {producto_dominante}
+PRODUCTOS_LISTA: {productos_lista}
+""".strip()
+
+    resp = client.responses.create(
+        model="gpt-4o-mini",
+        input=prompt,
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "clasificar_envio",
+                "schema": CLASIFICAR_ENVIO_SCHEMA_IA,
+                "strict": True,
+            }
+        },
+    )
+    return json.loads(resp.output_text)
+
+
+def enriquecer_contenido_ia(df: pd.DataFrame, df_p: pd.DataFrame, guia_col: str = "guia") -> tuple[pd.DataFrame, int]:
+    """Rellena CONTENIDO vacío en df (llave guia_col) usando los productos de df_p
+    (dominante por peso + lista) y OpenAI. Devuelve (df, n_clasificadas)."""
+    df = df.copy()
+    COL_ENVIO, COL_PROD, COL_PESO = "Envío", "Nombre producto", "Peso"
+    if any(c not in df_p.columns for c in (COL_ENVIO, COL_PROD, COL_PESO)):
+        return df, 0
+
+    dp = df_p[[COL_ENVIO, COL_PROD, COL_PESO]].copy()
+    dp[COL_ENVIO] = _clean_str_series(dp[COL_ENVIO])
+    dp[COL_PROD] = dp[COL_PROD].astype("string").fillna("").str.strip()
+    dp[COL_PESO] = pd.to_numeric(dp[COL_PESO], errors="coerce").fillna(0)
+    dp = dp[dp[COL_PROD] != ""]
+    if dp.empty:
+        return df, 0
+
+    dp = dp.groupby([COL_ENVIO, COL_PROD], as_index=False)[COL_PESO].sum()
+    idx_dom = dp.groupby(COL_ENVIO)[COL_PESO].idxmax()
+    dom = dp.loc[idx_dom, [COL_ENVIO, COL_PROD]].rename(columns={COL_PROD: "_DOM"})
+    lst = (
+        dp.sort_values([COL_ENVIO, COL_PESO], ascending=[True, False])
+        .groupby(COL_ENVIO, as_index=False)[COL_PROD]
+        .apply(lambda s: " | ".join(s.head(50).tolist()))
+        .rename(columns={COL_PROD: "_LISTA"})
+    )
+    agg = dom.merge(lst, on=COL_ENVIO, how="left")
+
+    if "CONTENIDO" not in df.columns:
+        df["CONTENIDO"] = pd.NA
+    df["CONTENIDO"] = df["CONTENIDO"].astype("string")
+
+    key = _clean_str_series(df[guia_col])
+    m = pd.DataFrame({"_k": key.values}).merge(agg, how="left", left_on="_k", right_on=COL_ENVIO)
+    df["_DOM"] = m["_DOM"].values
+    df["_LISTA"] = m["_LISTA"].values
+
+    mask = (
+        (df["CONTENIDO"].isna() | (df["CONTENIDO"].str.strip() == ""))
+        & df["_DOM"].notna()
+        & (df["_DOM"].astype(str).str.strip() != "")
+    )
+    n = int(mask.sum())
+    if n:
+        client = get_openai_client_mod()
+        cache, conts = {}, []
+        for d_, l_ in zip(
+            df.loc[mask, "_DOM"].astype(str).tolist(),
+            df.loc[mask, "_LISTA"].fillna("").astype(str).tolist(),
+        ):
+            l_ = l_[:3000]
+            k = (d_, l_)
+            if k not in cache:
+                cache[k] = gpt_clasificar_envio_mod(client, d_, l_)
+            conts.append(cache[k]["contenido"])
+        df.loc[mask, "CONTENIDO"] = conts
+
+    return df.drop(columns=["_DOM", "_LISTA"]), n
+
+
+def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.DataFrame, df_p=None):
+    """Cruza pistoleo (A) × Envíos Encargomio (B), arma columnas, concatena con el
+    histórico propio (dedup por guia, histórico manda), numera manifiestos desde
+    2000001 (+1 por corrida) y clasifica CONTENIDO vacío con IA si se pasa df_p.
+    Devuelve (df_concat, nuevo_manifiesto, n_ia). n_ia = -1 si la IA falló."""
+    MAN_BASE = 2000001
+
+    df_a = df_a.copy()
+    df_b = df_b.copy()
+    df_a["Envio"] = _clean_str_series(df_a["Envio"])
+    df_a = df_a.drop_duplicates(subset=["Envio"], keep="first")
+    df_b["NUMERO ENVIO"] = _clean_str_series(df_b["NUMERO ENVIO"])
+
+    alias_cols = {
+        "DIRECCIÓN DESTINO": "DESTINO DIRECCION",
+        "DIRECCIÃ“N DESTINO": "DESTINO DIRECCION",
+        "TELÉFONO": "DESTINO TELEFONO",
+        "TELÃ‰FONO": "DESTINO TELEFONO",
+    }
+    for src, dst in alias_cols.items():
+        if src in df_b.columns:
+            df_b = df_b.rename(columns={src: dst})
+    df_b = df_b.rename(columns={
+        "CLIENTE DESTINO": "NOMBRE DESTINO",
+        "CIUDAD DESTINO": "DESTINO CIUDAD",
+        "DEPARTAMENTO DESTINO": "DESTINO ESTADO",
+    })
+
+    df_b["COMPAÑÍA REMITENTE"] = "Largo Easy Corp"
+    df_b["REMITENTE DIRECCION"] = "11860 SW 144th Ct Ste 2"
+    df_b["REMITENTE TELEFONO"] = "3053996614"
+    df_b["REMITENTE CIUDAD"] = "Miami"
+    df_b["REMITENTE ESTADO"] = "FL"
+
+    df_a = df_a.rename(columns={"Envio": "guia"})
+    df_b = df_b.rename(columns={"NUMERO ENVIO": "guia"})
+    df_a["guia"] = _clean_str_series(df_a["guia"])
+    df_b["guia"] = _clean_str_series(df_b["guia"])
+    if "CATEGORÍAS PRODUCTOS" in df_b.columns:
+        df_b = df_b.rename(columns={"CATEGORÍAS PRODUCTOS": "CONTENIDO"})
+
+    cols_b = [
+        "guia", "CASILLERO", "VALOR", "COMPAÑÍA REMITENTE", "REMITENTE DIRECCION",
+        "REMITENTE CIUDAD", "REMITENTE ESTADO", "NOMBRE DESTINO", "DESTINO DIRECCION",
+        "DESTINO CIUDAD", "DESTINO ESTADO", "CONTENIDO", "PESO",
+    ]
+    cols_b = [c for c in cols_b if c in df_b.columns]
+    df_b_sel = df_b[cols_b].rename(columns={"PESO": "PESO LIBRAS"})
+
+    df_final = df_a.merge(df_b_sel, how="left", on="guia")
+    df_final["PIEZAS"] = 1
+    df_final["VALOR DECLARADO"] = np.random.randint(91, 100, size=len(df_final))
+    df_final["POSICION ARANCELARIA"] = "980720"
+    df_final["PESO LIBRAS"] = pd.to_numeric(df_final["PESO LIBRAS"], errors="coerce")
+    df_final["PESO KILOS"] = df_final["PESO LIBRAS"] / 2.2
+    df_final["FECHA GUIA"] = pd.to_datetime(datetime.now(ZoneInfo("America/New_York")).date())
+    if "CONTENIDO" not in df_final.columns:
+        df_final["CONTENIDO"] = pd.NA
+
+    hist = hist.copy() if hist is not None else pd.DataFrame()
+    if "guia" not in hist.columns and "GUIA" in hist.columns:
+        hist = hist.rename(columns={"GUIA": "guia"})
+    if not hist.empty and "guia" in hist.columns:
+        hist["guia"] = _clean_str_series(hist["guia"])
+
+    df_concat = pd.concat([hist, df_final], ignore_index=True)
+    df_concat = df_concat.drop_duplicates(subset=["guia"], keep="first").reset_index(drop=True)
+
+    if "MANIFIESTO" not in df_concat.columns:
+        df_concat["MANIFIESTO"] = pd.NA
+    man_num = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce")
+    mx = man_num[man_num >= MAN_BASE].max()
+    nuevo = int(mx) + 1 if pd.notna(mx) else MAN_BASE
+    df_concat.loc[man_num.isna(), "MANIFIESTO"] = nuevo
+    df_concat["MANIFIESTO"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce").astype("Int64")
+
+    n_ia = 0
+    if df_p is not None:
+        try:
+            df_concat, n_ia = enriquecer_contenido_ia(df_concat, df_p, guia_col="guia")
+        except Exception:
+            n_ia = -1
+
+    return df_concat, int(nuevo), n_ia
+
+
+# -----------------------------
 # UI: Uploaders
 # -----------------------------
 st.title("Manifiestos Astrid")
 
 modo = st.radio(
     "Selecciona el proceso",
-    ["Manifiestos Luma", "Celulares Fénix"],
+    ["Manifiestos Luma", "Celulares Fénix", "Envios Encargomio"],
     horizontal=True,
 )
 
@@ -1389,3 +1663,121 @@ elif modo == "Celulares Fénix":
         st.info(
             f"Esta corrida agregó {len(df_lote_actual)} guías nuevas (lote {lote_actual})."
         )
+
+elif modo == "Envios Encargomio":
+    st.subheader("Envios Encargomio — formato cajas (histórico propio)")
+    st.caption(
+        "Cruza Pistoleo × Envíos Encargomio, clasifica CONTENIDO con IA (la key de "
+        "OpenAI se toma en línea), numera manifiestos desde 2000001 (+1 por corrida) "
+        "y guarda en un histórico APARTE en Dropbox. La descarga arma los totales "
+        "(W.Lb / W.Kg / Value / Pieces) de forma automática por cada manifiesto."
+    )
+
+    DBX_FILE_PATH_EE = "/Manifiestos/Envios_encargomio.xlsx"
+
+    ee1, ee2, ee3 = st.columns(3)
+    with ee1:
+        up_a_ee = st.file_uploader("A — Pistoleo (Envio)", type=["xlsx", "xls"], key="up_a_ee")
+    with ee2:
+        up_b_ee = st.file_uploader("B — Envíos Encargomio (NUMERO ENVIO)", type=["xlsx", "xls"], key="up_b_ee")
+    with ee3:
+        up_p_ee = st.file_uploader("P — Productos (para CONTENIDO por IA)", type=["xlsx", "xls"], key="up_p_ee")
+
+    run_ee = st.button(
+        "Procesar y actualizar histórico Envios Encargomio",
+        type="primary",
+        disabled=not (up_a_ee and up_b_ee),
+    )
+
+    if run_ee:
+        dbx = get_dbx()
+        try:
+            _, res = dbx.files_download(DBX_FILE_PATH_EE)
+            hist_ee = pd.read_excel(io.BytesIO(res.content), sheet_name=0)
+        except dropbox.exceptions.ApiError:
+            hist_ee = pd.DataFrame()
+
+        df_a_ee = pd.read_excel(up_a_ee)
+        df_b_ee = pd.read_excel(up_b_ee)
+        df_p_ee = pd.read_excel(up_p_ee) if up_p_ee is not None else None
+
+        df_concat_ee, nuevo_man, n_ia = procesar_envios_encargomio(
+            df_a_ee, df_b_ee, hist_ee, df_p_ee
+        )
+
+        excel_hist_ee = dfs_to_excel_bytes({"HISTORICO": df_concat_ee})
+        dbx.files_upload(
+            excel_hist_ee, DBX_FILE_PATH_EE, mode=dropbox.files.WriteMode.overwrite
+        )
+
+        st.session_state["hist_ee"] = df_concat_ee
+        if n_ia >= 0:
+            msg_ia = f"CONTENIDO por IA: {n_ia} guía(s)"
+        else:
+            msg_ia = "IA no disponible en esta corrida (se conservó el CONTENIDO existente)"
+        st.success(
+            f"Histórico Envios Encargomio actualizado ({len(df_concat_ee)} filas). "
+            f"Nuevo manifiesto: {nuevo_man}. {msg_ia}."
+        )
+
+    if "hist_ee" not in st.session_state:
+        if st.button("Cargar histórico Envios Encargomio (solo descargar)"):
+            dbx = get_dbx()
+            try:
+                _, res = dbx.files_download(DBX_FILE_PATH_EE)
+                st.session_state["hist_ee"] = pd.read_excel(io.BytesIO(res.content), sheet_name=0)
+                st.success("Histórico cargado.")
+            except dropbox.exceptions.ApiError:
+                st.warning("Aún no existe el histórico Envios Encargomio. Procesa una vez para crearlo.")
+
+    if "hist_ee" in st.session_state:
+        hist_ee = st.session_state["hist_ee"]
+        if "guia" not in hist_ee.columns and "GUIA" in hist_ee.columns:
+            hist_ee = hist_ee.rename(columns={"GUIA": "guia"})
+
+        st.divider()
+        st.subheader("Descargar manifiesto (formato cajas con totales)")
+
+        if "MANIFIESTO" not in hist_ee.columns:
+            st.warning("El histórico no tiene columna MANIFIESTO.")
+        else:
+            manifiestos = (
+                pd.to_numeric(hist_ee["MANIFIESTO"], errors="coerce")
+                .dropna()
+                .astype("int64")
+                .sort_values()
+                .unique()
+                .tolist()
+            )
+            if not manifiestos:
+                st.info("El histórico no tiene manifiestos disponibles.")
+            else:
+                man_sel = st.selectbox("Selecciona el manifiesto", options=manifiestos)
+
+                df_m = hist_ee[
+                    pd.to_numeric(hist_ee["MANIFIESTO"], errors="coerce") == int(man_sel)
+                ].copy()
+                df_info = build_info_manifiesto_df(df_m)
+
+                tot_lb = round(float(pd.to_numeric(df_info["PESO LIBRAS"], errors="coerce").sum()), 2)
+                tot_kg = round(float(pd.to_numeric(df_info["PESO KILOS"], errors="coerce").sum()), 2)
+                tot_pz = int(pd.to_numeric(df_info["PIEZAS"], errors="coerce").sum())
+                tot_val = round(float(pd.to_numeric(df_info["VALOR DECLARADO"], errors="coerce").sum()), 2)
+
+                st.markdown(f"### Manifiesto {int(man_sel)} — {df_info['GUIA / consignment'].nunique()} guías")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Pieces", tot_pz)
+                c2.metric("W.Lb", tot_lb)
+                c3.metric("W.Kg", tot_kg)
+                c4.metric("Value $", tot_val)
+
+                st.dataframe(df_info, use_container_width=True)
+
+                data_info = info_manifiesto_excel_bytes(df_info)
+                fecha_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+                st.download_button(
+                    label=f"Descargar {fecha_str}-{int(man_sel)}-CAJAS.xlsx",
+                    data=data_info,
+                    file_name=f"{fecha_str}-{int(man_sel)}-CAJAS.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
