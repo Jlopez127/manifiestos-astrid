@@ -368,9 +368,27 @@ PRODUCTOS_LISTA: {productos_lista}
     return json.loads(resp.output_text)
 
 
-def enriquecer_contenido_ia(df: pd.DataFrame, df_p: pd.DataFrame, guia_col: str = "guia") -> tuple[pd.DataFrame, int]:
-    """Rellena CONTENIDO vacío en df (llave guia_col) usando los productos de df_p
-    (dominante por peso + lista) y OpenAI. Devuelve (df, n_clasificadas)."""
+# Categorías "no útiles" de Encargomio: se tratan como vacías y se reclasifican
+# con IA (la DIAN no admite "Otro"). Se comparan en minúsculas por substring.
+CATEGORIAS_GENERICAS = ("otro", "category for import", "sin categoria", "sin categoría")
+
+
+def _es_categoria_generica(v) -> bool:
+    if v is None or pd.isna(v):
+        return True
+    s = str(v).strip().lower()
+    if s in ("", "nan"):
+        return True
+    return any(g in s for g in CATEGORIAS_GENERICAS)
+
+
+def enriquecer_contenido_ia(df: pd.DataFrame, df_p: pd.DataFrame, guia_col: str = "guia", solo_guias=None) -> tuple[pd.DataFrame, int, list]:
+    """Reclasifica CONTENIDO vacío o genérico ('Otro', etc.) en df (llave guia_col)
+    con IA usando el producto dominante del casillero (df_p). Las que vienen 'Otro'/
+    vacío y NO tienen producto (no se pueden clasificar) se dejan EN BLANCO y se
+    marcan para categoría manual (la DIAN no admite 'Otro'). Si solo_guias se pasa,
+    ese blanqueo/marcado se limita a esas guías (el lote nuevo), para no alterar el
+    histórico viejo. Devuelve (df, n_clasificadas, guias_sin_categoria)."""
     df = df.copy()
     COL_ENVIO, COL_PROD, COL_PESO = "Envío", "Nombre producto", "Peso"
     if any(c not in df_p.columns for c in (COL_ENVIO, COL_PROD, COL_PESO)):
@@ -404,11 +422,13 @@ def enriquecer_contenido_ia(df: pd.DataFrame, df_p: pd.DataFrame, guia_col: str 
     df["_DOM"] = m["_DOM"].values
     df["_LISTA"] = m["_LISTA"].values
 
-    mask = (
-        (df["CONTENIDO"].isna() | (df["CONTENIDO"].str.strip() == ""))
-        & df["_DOM"].notna()
-        & (df["_DOM"].astype(str).str.strip() != "")
-    )
+    # "Necesita categoría" = vacío o genérico ('Otro', 'Category for import', ...)
+    generica = df["CONTENIDO"].map(_es_categoria_generica)
+    tiene_dom = df["_DOM"].notna() & (df["_DOM"].astype(str).str.strip() != "")
+
+    # Reclasificar SOLO las que tienen producto en el casillero (para no borrar
+    # datos de guías viejas que no vienen en este reporte de productos).
+    mask = generica & tiene_dom
     n = int(mask.sum())
     if n:
         client = get_openai_client_mod()
@@ -424,7 +444,15 @@ def enriquecer_contenido_ia(df: pd.DataFrame, df_p: pd.DataFrame, guia_col: str 
             conts.append(cache[k]["contenido"])
         df.loc[mask, "CONTENIDO"] = conts
 
-    return df.drop(columns=["_DOM", "_LISTA"]), n
+    # Genéricas/vacías que NO se pudieron clasificar (sin producto en el casillero):
+    # se dejan en BLANCO (nunca 'Otro') y se marcan para categoría manual (DIAN).
+    candidatos = generica & ~tiene_dom
+    if solo_guias is not None:
+        candidatos = candidatos & _clean_str_series(df[guia_col]).isin(set(solo_guias))
+    df.loc[candidatos, "CONTENIDO"] = pd.NA
+    sin_categoria = df.loc[candidatos, guia_col].dropna().astype(str).tolist()
+
+    return df.drop(columns=["_DOM", "_LISTA"]), n, sin_categoria
 
 
 def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.DataFrame, df_p=None):
@@ -501,6 +529,9 @@ def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.
     if not hist.empty and "guia" in hist.columns:
         hist["guia"] = _clean_str_series(hist["guia"])
 
+    guias_hist_set = set(hist["guia"].dropna()) if ("guia" in hist.columns and not hist.empty) else set()
+    guias_nuevas = set(df_final["guia"].dropna()) - guias_hist_set
+
     df_concat = pd.concat([hist, df_final], ignore_index=True)
     df_concat = df_concat.drop_duplicates(subset=["guia"], keep="first").reset_index(drop=True)
 
@@ -513,13 +544,16 @@ def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.
     df_concat["MANIFIESTO"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce").astype("Int64")
 
     n_ia = 0
+    sin_categoria = []
     if df_p is not None:
         try:
-            df_concat, n_ia = enriquecer_contenido_ia(df_concat, df_p, guia_col="guia")
+            df_concat, n_ia, sin_categoria = enriquecer_contenido_ia(
+                df_concat, df_p, guia_col="guia", solo_guias=guias_nuevas
+            )
         except Exception:
             n_ia = -1
 
-    return df_concat, int(nuevo), n_ia, guias_sin_peso
+    return df_concat, int(nuevo), n_ia, guias_sin_peso, sin_categoria
 
 
 # -----------------------------
@@ -1710,7 +1744,7 @@ elif modo == "Envios Encargomio":
         df_b_ee = pd.read_excel(up_b_ee)
         df_p_ee = pd.read_excel(up_p_ee) if up_p_ee is not None else None
 
-        df_concat_ee, nuevo_man, n_ia, guias_sin_peso = procesar_envios_encargomio(
+        df_concat_ee, nuevo_man, n_ia, guias_sin_peso, guias_sin_categoria = procesar_envios_encargomio(
             df_a_ee, df_b_ee, hist_ee, df_p_ee
         )
 
@@ -1734,6 +1768,13 @@ elif modo == "Envios Encargomio":
                 f"⚠ {len(guias_sin_peso)} guía(s) pistoleadas SIN cruce en Envíos Encargomio "
                 f"o con peso inválido. Entran al histórico con peso vacío; revísalas: "
                 + ", ".join(guias_sin_peso)
+            )
+
+        if guias_sin_categoria:
+            st.warning(
+                f"⚠ {len(guias_sin_categoria)} envío(s) SIN categoría (venían 'Otro'/vacío y no "
+                f"tienen producto en el casillero para reclasificar). Requieren CONTENIDO manual "
+                f"para la DIAN: " + ", ".join(guias_sin_categoria)
             )
 
     if "hist_ee" not in st.session_state:
