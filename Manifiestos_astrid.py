@@ -462,6 +462,30 @@ def enriquecer_contenido_ia(df: pd.DataFrame, df_p: pd.DataFrame, guia_col: str 
     return df.drop(columns=["_DOM", "_LISTA"]), n, sin_categoria
 
 
+def leer_pistoleo_envio(archivo) -> pd.DataFrame:
+    """Lee el pistoleo y devuelve un df con columna 'Envio'. Tolera:
+    - archivo con columna 'Envio' (o alias 'guia'/'GUIA'/'NUMERO ENVIO'),
+    - archivo de UNA sola columna SIN encabezado, donde cada celda es una guía
+      (incluida la primera, que pandas toma como nombre de columna)."""
+    df = pd.read_excel(archivo)
+
+    for alias in ("Envio", "ENVIO", "envio", "Envío", "guia", "GUIA", "Guia", "NUMERO ENVIO"):
+        if alias in df.columns:
+            return df.rename(columns={alias: "Envio"})
+
+    if df.shape[1] == 1:
+        col = df.columns[0]
+        col_str = str(col).strip()
+        # Si el "encabezado" es en realidad una guía (numérico), lo recuperamos como fila.
+        if col_str.replace(".0", "").isdigit():
+            valores = [col] + df.iloc[:, 0].tolist()
+            return pd.DataFrame({"Envio": valores})
+        return df.rename(columns={col: "Envio"})
+
+    # Varias columnas sin 'Envio' reconocible: usar la primera como llave.
+    return df.rename(columns={df.columns[0]: "Envio"})
+
+
 def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.DataFrame, df_p=None):
     """Cruza pistoleo (A) × Envíos Encargomio (B), arma columnas, concatena con el
     histórico propio (dedup por guia, histórico manda), numera manifiestos desde
@@ -1759,7 +1783,7 @@ elif modo == "Envios Encargomio":
         except dropbox.exceptions.ApiError:
             hist_ee = pd.DataFrame()
 
-        df_a_ee = pd.read_excel(up_a_ee)
+        df_a_ee = leer_pistoleo_envio(up_a_ee)
         df_b_ee = pd.read_excel(up_b_ee)
         df_p_ee = pd.read_excel(up_p_ee) if up_p_ee is not None else None
 
