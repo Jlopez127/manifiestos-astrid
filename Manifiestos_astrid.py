@@ -264,6 +264,13 @@ def build_info_manifiesto_df(df: pd.DataFrame) -> pd.DataFrame:
     for c in INFO_MANIFIESTO_COLS:
         if c not in d.columns:
             d[c] = pd.NA
+
+    # GARANTÍA DIAN (red de seguridad final): ningún manifiesto exportado puede
+    # contener 'Otro'/genérico, venga de donde venga (histórico viejo, edición
+    # manual, etc.). Si aparece, se deja en blanco.
+    d["CONTENIDO"] = d["CONTENIDO"].astype("string")
+    d.loc[d["CONTENIDO"].map(_es_categoria_generica), "CONTENIDO"] = pd.NA
+
     return d[INFO_MANIFIESTO_COLS].copy()
 
 
@@ -544,14 +551,26 @@ def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.
     df_concat["MANIFIESTO"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce").astype("Int64")
 
     n_ia = 0
-    sin_categoria = []
     if df_p is not None:
         try:
-            df_concat, n_ia, sin_categoria = enriquecer_contenido_ia(
+            df_concat, n_ia, _ = enriquecer_contenido_ia(
                 df_concat, df_p, guia_col="guia", solo_guias=guias_nuevas
             )
         except Exception:
             n_ia = -1
+
+    # GARANTÍA: ninguna categoría 'Otro'/genérica puede quedar en el lote nuevo.
+    # Cubre TODOS los casos: sin archivo P, sin producto en casillero, o IA caída.
+    # Lo que no se pudo clasificar queda EN BLANCO (nunca 'Otro') y se marca.
+    if "CONTENIDO" not in df_concat.columns:
+        df_concat["CONTENIDO"] = pd.NA
+    df_concat["CONTENIDO"] = df_concat["CONTENIDO"].astype("string")
+    gen_lote = (
+        df_concat["CONTENIDO"].map(_es_categoria_generica)
+        & _clean_str_series(df_concat["guia"]).isin(set(guias_nuevas))
+    )
+    df_concat.loc[gen_lote, "CONTENIDO"] = pd.NA
+    sin_categoria = df_concat.loc[gen_lote, "guia"].dropna().astype(str).tolist()
 
     return df_concat, int(nuevo), n_ia, guias_sin_peso, sin_categoria
 
