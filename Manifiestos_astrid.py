@@ -9,6 +9,7 @@ Created on Thu Feb 19 20:28:41 2026
 # -*- coding: utf-8 -*-
 
 import io
+import re
 import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -265,10 +266,11 @@ def build_info_manifiesto_df(df: pd.DataFrame) -> pd.DataFrame:
         if c not in d.columns:
             d[c] = pd.NA
 
-    # GARANTÍA DIAN (red de seguridad final): ningún manifiesto exportado puede
-    # contener 'Otro'/genérico, venga de donde venga (histórico viejo, edición
-    # manual, etc.). Si aparece, se deja en blanco.
-    d["CONTENIDO"] = d["CONTENIDO"].astype("string")
+    # GARANTÍA DIAN (red de seguridad final):
+    # 1) el CONTENIDO nunca lleva cantidades/número de productos.
+    # 2) ningún manifiesto exportado puede contener 'Otro'/genérico, venga de donde
+    #    venga (histórico viejo, edición manual, etc.); si aparece, se deja en blanco.
+    d["CONTENIDO"] = d["CONTENIDO"].astype("string").map(_limpiar_cantidad).astype("string")
     d.loc[d["CONTENIDO"].map(_es_categoria_generica), "CONTENIDO"] = pd.NA
 
     return d[INFO_MANIFIESTO_COLS].copy()
@@ -332,7 +334,7 @@ CLASIFICAR_ENVIO_SCHEMA_IA = {
         "confianza": {"type": "integer", "minimum": 0, "maximum": 100},
         "contenido": {
             "type": "string",
-            "description": "Texto corto para CONTENIDO (sin marcas). Ej: 'Calzado (tenis)', 'Celular', 'Ropa'.",
+            "description": "Texto corto para CONTENIDO (sin marcas y SIN cantidades ni números de productos). Ej: 'Calzado (tenis)', 'Celular', 'Ropa'.",
         },
     },
     "required": ["categoria", "confianza", "contenido"],
@@ -354,6 +356,9 @@ Reglas:
 - Usa PRODUCTOS_LISTA solo como contexto.
 - NO menciones marcas (Nike, Apple, etc). Solo categoria general.
 - 'contenido' debe ser corto (1-4 palabras). Puedes aclarar entre paréntesis sin marcas.
+- NUNCA incluyas cantidades ni números de productos. Prohibido poner '(4)', 'x3',
+  '2 unidades', '5 pares', etc. Solo la categoría (los números de un modelo como
+  'PS4' o '3D' sí se permiten porque son parte del producto, no cantidades).
 - Si es muy variado, usa Miscelaneo.
 
 PRODUCTO_DOMINANTE: {producto_dominante}
@@ -387,6 +392,30 @@ def _es_categoria_generica(v) -> bool:
     if s in ("", "nan"):
         return True
     return any(g in s for g in CATEGORIAS_GENERICAS)
+
+
+# Regla DIAN: el CONTENIDO NUNCA lleva cantidades / número de productos.
+_UNID = r"(?:unidad(?:es)?|uds?|und|par(?:es)?|piezas?|pzas?|pcs?|productos?|items?|u)"
+# Paréntesis que son SOLO una cantidad -> '(4)', '(x3)', '(2 unidades)'. No toca
+# '(tenis)', '(accesorio PS4)', etc. (llevan letras además del número).
+_RE_PAREN_CANT = re.compile(r"\s*\(\s*x?\s*\d+(?:[.,]\d+)?\s*" + _UNID + r"?\s*\)", re.IGNORECASE)
+# Cantidades sueltas: 'x3', '2 unidades', '5 pares'...
+_RE_CANT_SUELTA = re.compile(r"\b(?:x\s*\d+|\d+\s*" + _UNID + r")\b", re.IGNORECASE)
+
+
+def _limpiar_cantidad(texto):
+    """Quita cantidades/número de productos del CONTENIDO (regla DIAN), sin romper
+    números que son parte del producto ('PS4', '3D', '4K'). Ej:
+    'Prendas de vestir (4)' -> 'Prendas de vestir'; 'Impresora 3D' se conserva."""
+    if texto is None or pd.isna(texto):
+        return texto
+    s = str(texto)
+    s = _RE_PAREN_CANT.sub("", s)
+    s = _RE_CANT_SUELTA.sub("", s)
+    s = re.sub(r"^\s*\d+\s+", "", s)      # cantidad al inicio: '4 Prendas' -> 'Prendas'
+    s = re.sub(r"\(\s*\)", "", s)         # paréntesis vacíos que hayan quedado
+    s = re.sub(r"\s{2,}", " ", s).strip(" ,-–—")
+    return s if s else pd.NA
 
 
 def enriquecer_contenido_ia(df: pd.DataFrame, df_p: pd.DataFrame, guia_col: str = "guia", solo_guias=None) -> tuple[pd.DataFrame, int, list]:
@@ -448,7 +477,7 @@ def enriquecer_contenido_ia(df: pd.DataFrame, df_p: pd.DataFrame, guia_col: str 
             k = (d_, l_)
             if k not in cache:
                 cache[k] = gpt_clasificar_envio_mod(client, d_, l_)
-            conts.append(cache[k]["contenido"])
+            conts.append(_limpiar_cantidad(cache[k]["contenido"]))
         df.loc[mask, "CONTENIDO"] = conts
 
     # Genéricas/vacías que NO se pudieron clasificar (sin producto en el casillero):
