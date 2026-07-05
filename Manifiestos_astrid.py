@@ -665,6 +665,46 @@ def simular_destinos_manifiesto(df_manifiesto, filas_a_evaluar_idx=None):
     return df
 
 
+def _leer_dian_astrid(dbx, path):
+    """Lee las hojas DIAN y ASTRID del histórico Envios Encargomio en Dropbox.
+    Devuelve (df_dian, df_astrid); vacías si el archivo o esas hojas no existen
+    (arranque limpio: NO se migra ningún HISTORICO viejo)."""
+    try:
+        _, res = dbx.files_download(path)
+    except dropbox.exceptions.ApiError:
+        return pd.DataFrame(), pd.DataFrame()
+    xls = pd.ExcelFile(io.BytesIO(res.content))
+    dian = pd.read_excel(xls, sheet_name="DIAN") if "DIAN" in xls.sheet_names else pd.DataFrame()
+    astrid = pd.read_excel(xls, sheet_name="ASTRID") if "ASTRID" in xls.sheet_names else pd.DataFrame()
+    return dian, astrid
+
+
+def _construir_dian_astrid(df_rows):
+    """Desde filas internas (destino real + *_SIM + _DESTINO_SIMULADO + CASILLERO +
+    FECHA_MANIFIESTO) construye (df_dian, df_astrid) en formato cajas para persistir.
+    DIAN: destino SIMULADO donde la bandera está activa (cajas puro, sin casillero).
+    ASTRID: destino REAL + CASILLERO + FECHA_MANIFIESTO al final. (Sin totales; los
+    totales solo se agregan en la descarga.)"""
+    if "_DESTINO_SIMULADO" in df_rows.columns:
+        _sim = df_rows["_DESTINO_SIMULADO"].apply(lambda v: (not pd.isna(v)) and bool(v))
+    else:
+        _sim = pd.Series(False, index=df_rows.index)
+
+    _d = df_rows.copy()
+    for _r, _s in _DESTINO_SIM_COLS.items():
+        if _r in _d.columns and _s in _d.columns:
+            _d.loc[_sim, _r] = _d.loc[_sim, _s]
+    df_dian = build_info_manifiesto_df(_d)
+
+    df_astrid = build_info_manifiesto_df(df_rows)
+    df_astrid["CASILLERO"] = df_rows["CASILLERO"].values if "CASILLERO" in df_rows.columns else pd.NA
+    if "FECHA_MANIFIESTO" in df_rows.columns:
+        df_astrid["FECHA_MANIFIESTO"] = pd.to_datetime(df_rows["FECHA_MANIFIESTO"], errors="coerce").values
+    else:
+        df_astrid["FECHA_MANIFIESTO"] = pd.NaT
+    return df_dian, df_astrid
+
+
 def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.DataFrame, df_p=None, manifiesto_destino=None):
     """Cruza pistoleo (A) × Envíos Encargomio (B), arma un manifiesto en formato
     cajas (INFO MANIFIESTO) y lo concatena con el histórico propio.
@@ -2026,25 +2066,20 @@ elif modo == "Envios Encargomio":
 
     manifiesto_destino = None
     if modo_ee == "Agregar a manifiesto existente":
-        try:
-            _dbx_sel = get_dbx()
-            _, _res_sel = _dbx_sel.files_download(DBX_FILE_PATH_EE)
-            _hist_sel = pd.read_excel(io.BytesIO(_res_sel.content), sheet_name=0)
-        except dropbox.exceptions.ApiError:
-            _hist_sel = pd.DataFrame()
+        _, _astrid_sel = _leer_dian_astrid(get_dbx(), DBX_FILE_PATH_EE)
 
         _mn = (
-            pd.to_numeric(_hist_sel["MANIFIESTO"], errors="coerce").dropna()
-            if "MANIFIESTO" in _hist_sel.columns else pd.Series(dtype="float")
+            pd.to_numeric(_astrid_sel["MANIFIESTO"], errors="coerce").dropna()
+            if ("MANIFIESTO" in _astrid_sel.columns and not _astrid_sel.empty) else pd.Series(dtype="float")
         )
         if _mn.empty:
             st.warning("Aún no hay manifiestos en el histórico. Crea uno en 'Crear manifiesto nuevo' primero.")
         else:
             _ult = int(_mn.max())   # último = número MÁS ALTO
             _fecha_txt = ""
-            if "FECHA_MANIFIESTO" in _hist_sel.columns:
+            if "FECHA_MANIFIESTO" in _astrid_sel.columns:
                 _f = pd.to_datetime(
-                    _hist_sel.loc[pd.to_numeric(_hist_sel["MANIFIESTO"], errors="coerce") == _ult, "FECHA_MANIFIESTO"],
+                    _astrid_sel.loc[pd.to_numeric(_astrid_sel["MANIFIESTO"], errors="coerce") == _ult, "FECHA_MANIFIESTO"],
                     errors="coerce",
                 ).max()
                 if pd.notna(_f):
@@ -2070,11 +2105,12 @@ elif modo == "Envios Encargomio":
 
     if run_ee:
         dbx = get_dbx()
-        try:
-            _, res = dbx.files_download(DBX_FILE_PATH_EE)
-            hist_ee = pd.read_excel(io.BytesIO(res.content), sheet_name=0)
-        except dropbox.exceptions.ApiError:
-            hist_ee = pd.DataFrame()
+        # LECTURA: hojas DIAN y ASTRID (vacías si no existen). El 'hist' para procesar se
+        # reconstruye desde ASTRID (destino real + casillero + guia + manifiesto).
+        dian_prev, astrid_prev = _leer_dian_astrid(dbx, DBX_FILE_PATH_EE)
+        hist_ee = astrid_prev.copy()
+        if "guia" not in hist_ee.columns and "GUIA / consignment" in hist_ee.columns:
+            hist_ee = hist_ee.rename(columns={"GUIA / consignment": "guia"})
 
         df_a_ee = leer_pistoleo_envio(up_a_ee)
         df_b_ee = pd.read_excel(up_b_ee)
@@ -2083,14 +2119,31 @@ elif modo == "Envios Encargomio":
         df_concat_ee, man_usado, n_ia, guias_sin_peso, guias_sin_categoria = procesar_envios_encargomio(
             df_a_ee, df_b_ee, hist_ee, df_p_ee, manifiesto_destino=manifiesto_destino
         )
-        _nuevos = len(df_concat_ee) - len(hist_ee)   # envíos nuevos que entraron
 
-        excel_hist_ee = dfs_to_excel_bytes({"HISTORICO": df_concat_ee})
-        dbx.files_upload(
-            excel_hist_ee, DBX_FILE_PATH_EE, mode=dropbox.files.WriteMode.overwrite
+        # ESCRITURA: solo las filas NUEVAS (no estaban en ASTRID previo) se materializan y se
+        # CONCATENAN a cada hoja; las viejas quedan congeladas. Dedup por guía (histórico manda).
+        _prev_guias = (
+            set(_clean_str_series(astrid_prev["GUIA / consignment"]).dropna())
+            if ("GUIA / consignment" in astrid_prev.columns and not astrid_prev.empty) else set()
+        )
+        df_nuevas = df_concat_ee[~_clean_str_series(df_concat_ee["guia"]).isin(_prev_guias)].copy()
+        _nuevos = len(df_nuevas)
+
+        dian_new, astrid_new = _construir_dian_astrid(df_nuevas)
+        dian_final = (
+            pd.concat([dian_prev, dian_new], ignore_index=True)
+            .drop_duplicates(subset=["GUIA / consignment"], keep="first").reset_index(drop=True)
+        )
+        astrid_final = (
+            pd.concat([astrid_prev, astrid_new], ignore_index=True)
+            .drop_duplicates(subset=["GUIA / consignment"], keep="first").reset_index(drop=True)
         )
 
-        st.session_state["hist_ee"] = df_concat_ee
+        excel_bytes_ee = dfs_to_excel_bytes({"DIAN": dian_final, "ASTRID": astrid_final})
+        dbx.files_upload(excel_bytes_ee, DBX_FILE_PATH_EE, mode=dropbox.files.WriteMode.overwrite)
+
+        st.session_state["dian_ee"] = dian_final
+        st.session_state["astrid_ee"] = astrid_final
         if n_ia >= 0:
             msg_ia = f"CONTENIDO por IA: {n_ia} guía(s)"
         else:
@@ -2100,7 +2153,7 @@ elif modo == "Envios Encargomio":
         else:
             _accion = f"Se agregaron {_nuevos} envío(s) al manifiesto {man_usado}"
         st.success(
-            f"Histórico Envios Encargomio actualizado ({len(df_concat_ee)} filas). "
+            f"Histórico actualizado (DIAN {len(dian_final)} / ASTRID {len(astrid_final)} filas). "
             f"{_accion}. {msg_ia}."
         )
 
@@ -2118,29 +2171,28 @@ elif modo == "Envios Encargomio":
                 f"para la DIAN: " + ", ".join(guias_sin_categoria)
             )
 
-    if "hist_ee" not in st.session_state:
+    if "astrid_ee" not in st.session_state:
         if st.button("Cargar histórico Envios Encargomio (solo descargar)"):
-            dbx = get_dbx()
-            try:
-                _, res = dbx.files_download(DBX_FILE_PATH_EE)
-                st.session_state["hist_ee"] = pd.read_excel(io.BytesIO(res.content), sheet_name=0)
-                st.success("Histórico cargado.")
-            except dropbox.exceptions.ApiError:
+            _dian_l, _astrid_l = _leer_dian_astrid(get_dbx(), DBX_FILE_PATH_EE)
+            if _dian_l.empty and _astrid_l.empty:
                 st.warning("Aún no existe el histórico Envios Encargomio. Procesa una vez para crearlo.")
+            else:
+                st.session_state["dian_ee"] = _dian_l
+                st.session_state["astrid_ee"] = _astrid_l
+                st.success("Histórico cargado.")
 
-    if "hist_ee" in st.session_state:
-        hist_ee = st.session_state["hist_ee"]
-        if "guia" not in hist_ee.columns and "GUIA" in hist_ee.columns:
-            hist_ee = hist_ee.rename(columns={"GUIA": "guia"})
+    if "astrid_ee" in st.session_state:
+        dian_all = st.session_state["dian_ee"]
+        astrid_all = st.session_state["astrid_ee"]
 
         st.divider()
         st.subheader("Descargar manifiesto (formato cajas con totales)")
 
-        if "MANIFIESTO" not in hist_ee.columns:
-            st.warning("El histórico no tiene columna MANIFIESTO.")
+        if astrid_all.empty or "MANIFIESTO" not in astrid_all.columns:
+            st.warning("El histórico no tiene manifiestos.")
         else:
             manifiestos = (
-                pd.to_numeric(hist_ee["MANIFIESTO"], errors="coerce")
+                pd.to_numeric(astrid_all["MANIFIESTO"], errors="coerce")
                 .dropna()
                 .astype("int64")
                 .sort_values()
@@ -2152,54 +2204,44 @@ elif modo == "Envios Encargomio":
             else:
                 man_sel = st.selectbox("Selecciona el manifiesto", options=manifiestos)
 
-                df_m = hist_ee[
-                    pd.to_numeric(hist_ee["MANIFIESTO"], errors="coerce") == int(man_sel)
-                ].copy()
-                df_info = build_info_manifiesto_df(df_m)
+                df_dian_m = dian_all[
+                    pd.to_numeric(dian_all["MANIFIESTO"], errors="coerce") == int(man_sel)
+                ].copy().reset_index(drop=True)
+                df_astrid_m = astrid_all[
+                    pd.to_numeric(astrid_all["MANIFIESTO"], errors="coerce") == int(man_sel)
+                ].copy().reset_index(drop=True)
 
-                tot_lb = round(float(pd.to_numeric(df_info["PESO LIBRAS"], errors="coerce").sum()), 2)
-                tot_kg = round(float(pd.to_numeric(df_info["PESO KILOS"], errors="coerce").sum()), 2)
-                tot_pz = int(pd.to_numeric(df_info["PIEZAS"], errors="coerce").sum())
-                tot_val = round(float(pd.to_numeric(df_info["VALOR DECLARADO"], errors="coerce").sum()), 2)
+                tot_lb = round(float(pd.to_numeric(df_astrid_m["PESO LIBRAS"], errors="coerce").sum()), 2)
+                tot_kg = round(float(pd.to_numeric(df_astrid_m["PESO KILOS"], errors="coerce").sum()), 2)
+                tot_pz = int(pd.to_numeric(df_astrid_m["PIEZAS"], errors="coerce").sum())
+                tot_val = round(float(pd.to_numeric(df_astrid_m["VALOR DECLARADO"], errors="coerce").sum()), 2)
 
-                st.markdown(f"### Manifiesto {int(man_sel)} — {df_info['GUIA / consignment'].nunique()} guías")
+                # Simulado = destino en DIAN != destino en ASTRID para la misma guía.
+                _di = df_dian_m.set_index(_clean_str_series(df_dian_m["GUIA / consignment"]))["NOMBRE DESTINO"]
+                _as = df_astrid_m.set_index(_clean_str_series(df_astrid_m["GUIA / consignment"]))["NOMBRE DESTINO"]
+                _guias_sim = {
+                    _normalize_excel_key(g)
+                    for g in _as.index
+                    if (g in _di.index) and (str(_di.loc[g]) != str(_as.loc[g])) and _normalize_excel_key(g)
+                }
+
+                st.markdown(f"### Manifiesto {int(man_sel)} — {df_astrid_m['GUIA / consignment'].nunique()} guías")
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Pieces", tot_pz)
                 c2.metric("W.Lb", tot_lb)
                 c3.metric("W.Kg", tot_kg)
                 c4.metric("Value $", tot_val)
-
-                st.dataframe(df_info, use_container_width=True)
+                st.caption(f"Filas con destino simulado en este manifiesto: {len(_guias_sim)}")
+                st.dataframe(df_astrid_m, use_container_width=True)
 
                 fecha_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
 
-                # Filas simuladas de este manifiesto (bandera _DESTINO_SIMULADO == True)
-                if "_DESTINO_SIMULADO" in df_m.columns:
-                    _sim_mask = df_m["_DESTINO_SIMULADO"].apply(lambda v: (not pd.isna(v)) and bool(v))
-                else:
-                    _sim_mask = pd.Series(False, index=df_m.index)
+                # DIAN: la hoja ya trae el destino resuelto (simulado/real) -> solo + totales.
+                dian_bytes = info_manifiesto_excel_bytes(df_dian_m[INFO_MANIFIESTO_COLS])
 
-                # ---------- DIAN: destino simulado donde aplique (formato cajas, sin casillero) ----------
-                df_dian_src = df_m.copy()
-                for _real, _sim in _DESTINO_SIM_COLS.items():
-                    if _real in df_dian_src.columns and _sim in df_dian_src.columns:
-                        df_dian_src.loc[_sim_mask, _real] = df_dian_src.loc[_sim_mask, _sim]
-                df_dian = build_info_manifiesto_df(df_dian_src)
-                dian_bytes = info_manifiesto_excel_bytes(df_dian)
-
-                # ---------- Astrid: destino REAL + CASILLERO al final + filas simuladas en rojo ----------
-                df_astrid = df_info.copy()                       # real intacto (mismas filas/orden que df_m)
-                df_astrid["CASILLERO"] = (
-                    df_m["CASILLERO"].values if "CASILLERO" in df_m.columns else pd.NA
-                )
-                _guias_sim = {
-                    _normalize_excel_key(g)
-                    for g in df_m.loc[_sim_mask, "guia"].tolist()
-                    if _normalize_excel_key(g)
-                }
-                # Se genera con info_manifiesto_excel_bytes (conserva el pie de totales) y se
-                # pinta encima abriendo con openpyxl -> Astrid mantiene totales + rojo.
-                _astrid_bytes = info_manifiesto_excel_bytes(df_astrid)
+                # Astrid: cajas + CASILLERO + totales, con las simuladas en rojo.
+                _astrid_cols = INFO_MANIFIESTO_COLS + (["CASILLERO"] if "CASILLERO" in df_astrid_m.columns else [])
+                _astrid_bytes = info_manifiesto_excel_bytes(df_astrid_m[_astrid_cols])
                 _wb = load_workbook(io.BytesIO(_astrid_bytes))
                 _paint_rows_red_by_guia(_wb["INFO MANIFIESTO"], "GUIA / consignment", _guias_sim)
                 _buf = io.BytesIO()
@@ -2207,18 +2249,17 @@ elif modo == "Envios Encargomio":
                 _buf.seek(0)
                 astrid_bytes = _buf.getvalue()
 
-                st.caption(f"Filas con destino simulado en este manifiesto: {int(_sim_mask.sum())}")
                 cold1, cold2 = st.columns(2)
                 with cold1:
                     st.download_button(
-                        label=f"⬇ DIAN (destino simulado)",
+                        label="⬇ DIAN (destino simulado)",
                         data=dian_bytes,
                         file_name=f"{fecha_str}-{int(man_sel)}-DIAN-CAJAS.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
                 with cold2:
                     st.download_button(
-                        label=f"⬇ Astrid (real + casillero, simuladas en rojo)",
+                        label="⬇ Astrid (real + casillero, simuladas en rojo)",
                         data=astrid_bytes,
                         file_name=f"{fecha_str}-{int(man_sel)}-ASTRID-CAJAS.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
