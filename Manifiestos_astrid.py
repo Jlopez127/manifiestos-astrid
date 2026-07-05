@@ -17,6 +17,7 @@ import dropbox
 import streamlit as st
 import numpy as np
 import json
+from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openai import OpenAI
@@ -492,42 +493,211 @@ def enriquecer_contenido_ia(df: pd.DataFrame, df_p: pd.DataFrame, guia_col: str 
 
 
 def leer_pistoleo_envio(archivo) -> pd.DataFrame:
-    """Lee el pistoleo y devuelve un df con columna 'Envio'. Tolera:
-    - archivo con columna 'Envio' (o alias 'guia'/'GUIA'/'NUMERO ENVIO'),
-    - archivo de UNA sola columna SIN encabezado, donde cada celda es una guía
-      (incluida la primera, que pandas toma como nombre de columna)."""
+    """Lee el pistoleo (A) y devuelve un DataFrame con EXACTAMENTE 4 columnas:
+    'Envio', 'VALOR_A', 'POSICION_A', 'DESCRIPCION_A' (un envío por fila, sin repetidos).
+
+    Formato esperado: Excel con columnas 'Envio', 'Valor declarado', 'Posicion
+    arancelaria', 'Descripción' (+ columnas basura 'Unnamed: N' que se descartan).
+    Tolera alias del envío (Envio/ENVIO/envio/Envío/guia/GUIA/NUMERO ENVIO) y el caso
+    viejo de archivo de UNA sola columna SIN encabezado (cada celda es una guía; ahí
+    VALOR_A / POSICION_A / DESCRIPCION_A quedan vacías). NO deduplica; no transforma los
+    valores más allá de limpiar whitespace."""
     df = pd.read_excel(archivo)
 
-    for alias in ("Envio", "ENVIO", "envio", "Envío", "guia", "GUIA", "Guia", "NUMERO ENVIO"):
-        if alias in df.columns:
-            return df.rename(columns={alias: "Envio"})
+    def _norm(name) -> str:
+        s = str(name).strip().lower()
+        for a, b in (("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u"), ("ü", "u"), ("ñ", "n")):
+            s = s.replace(a, b)
+        return re.sub(r"\s+", " ", s)
 
-    if df.shape[1] == 1:
-        col = df.columns[0]
-        col_str = str(col).strip()
-        # Si el "encabezado" es en realidad una guía (numérico), lo recuperamos como fila.
-        if col_str.replace(".0", "").isdigit():
-            valores = [col] + df.iloc[:, 0].tolist()
-            return pd.DataFrame({"Envio": valores})
-        return df.rename(columns={col: "Envio"})
+    # mapa nombre_normalizado -> nombre_real (primera coincidencia gana); descarta 'Unnamed'
+    norm_map: dict[str, object] = {}
+    for c in df.columns:
+        norm_map.setdefault(_norm(c), c)
 
-    # Varias columnas sin 'Envio' reconocible: usar la primera como llave.
-    return df.rename(columns={df.columns[0]: "Envio"})
+    def _col(*candidatos):
+        for cand in candidatos:
+            if cand in norm_map:
+                return norm_map[cand]
+        return None
+
+    envio_col = _col("envio", "guia", "numero envio")
+    valor_col = _col("valor declarado")
+    posic_col = _col("posicion arancelaria")
+    desc_col = _col("descripcion")
+
+    # Caso viejo: archivo de UNA sola columna SIN encabezado (la 1a guía quedó como
+    # nombre de columna). Se recupera como Envio y las otras 3 columnas van vacías.
+    if envio_col is None:
+        if df.shape[1] >= 1:
+            col = df.columns[0]
+            if str(col).strip().replace(".0", "").isdigit():
+                envios = pd.Series([col] + df.iloc[:, 0].tolist())
+            else:
+                envios = df.iloc[:, 0]
+        else:
+            envios = pd.Series([], dtype="object")
+        result = pd.DataFrame({"Envio": _clean_str_series(envios)})
+        result["VALOR_A"] = pd.NA
+        result["POSICION_A"] = pd.NA
+        result["DESCRIPCION_A"] = pd.NA
+        return result[["Envio", "VALOR_A", "POSICION_A", "DESCRIPCION_A"]]
+
+    def _texto_o_na(serie):
+        s = serie.astype("string").str.strip()
+        return s.mask(s.isna() | (s == "") | (s.str.lower() == "nan"), pd.NA)
+
+    result = pd.DataFrame()
+
+    # Envio -> string, trim, quitar .0
+    result["Envio"] = _clean_str_series(df[envio_col])
+
+    # VALOR_A -> numérico (coerce)
+    result["VALOR_A"] = pd.to_numeric(df[valor_col], errors="coerce") if valor_col is not None else pd.NA
+
+    # POSICION_A -> string; solo limpiar whitespace/tab (conservar el valor tal cual:
+    # '8471.30.00.00', 'Comercial', 'Regular', '0'); vacío/'nan' -> NA.
+    if posic_col is not None:
+        pos = df[posic_col].astype("string").str.replace(r"\s+", " ", regex=True).str.strip()
+        result["POSICION_A"] = pos.mask(pos.isna() | (pos == "") | (pos.str.lower() == "nan"), pd.NA)
+    else:
+        result["POSICION_A"] = pd.NA
+
+    # DESCRIPCION_A -> string trim; vacío/'nan' -> NA
+    result["DESCRIPCION_A"] = _texto_o_na(df[desc_col]) if desc_col is not None else pd.NA
+
+    return result[["Envio", "VALOR_A", "POSICION_A", "DESCRIPCION_A"]]
 
 
-def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.DataFrame, df_p=None):
-    """Cruza pistoleo (A) × Envíos Encargomio (B), arma columnas, concatena con el
-    histórico propio (dedup por guia, histórico manda), numera manifiestos desde
-    2000001 (+1 por corrida) y clasifica CONTENIDO vacío con IA si se pasa df_p.
-    Devuelve (df_concat, nuevo_manifiesto, n_ia). n_ia = -1 si la IA falló."""
+def _ordinal_en(n: int) -> str:
+    """Ordinal en inglés: 1st, 2nd, 3rd, 4th, 11th, 12th, 13th, 21st, 144th..."""
+    if 10 <= (n % 100) <= 13:
+        sufijo = "th"
+    else:
+        sufijo = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{sufijo}"
+
+
+def _remitente_simulado_miami(fake) -> dict:
+    """Devuelve un remitente simulado (5 claves) con patrón de direcciones de Miami.
+    'fake' es un Faker('en_US') ya instanciado (para no crear uno por fila)."""
+    numero = random.randint(1000, 99999)
+    cuadrante = random.choice(["SW", "NW", "W", "SE", "E", "NE"])
+    calle = _ordinal_en(random.randint(1, 199))
+    via = random.choice(["St", "Ct", "Av", "Terr"])
+    telefono = random.choice(["305", "786"]) + "".join(random.choices("0123456789", k=7))
+    return {
+        "COMPAÑÍA REMITENTE": f"{fake.first_name()} {fake.last_name()}",
+        "REMITENTE DIRECCION": f"{numero} {cuadrante} {calle} {via}",
+        "REMITENTE TELEFONO": telefono,
+        "REMITENTE CIUDAD": "Miami",
+        "REMITENTE ESTADO": "FL",
+    }
+
+
+# Columnas donde vive el destino SIMULADO (real -> *_SIM). El real nunca se pierde.
+_DESTINO_SIM_COLS = {
+    "NOMBRE DESTINO": "NOMBRE DESTINO_SIM",
+    "DESTINO DIRECCION": "DESTINO DIRECCION_SIM",
+    "DESTINO CIUDAD": "DESTINO CIUDAD_SIM",
+    "DESTINO ESTADO": "DESTINO ESTADO_SIM",
+    "DESTINO TELEFONO": "DESTINO TELEFONO_SIM",
+}
+
+
+def simular_destinos_manifiesto(df_manifiesto, filas_a_evaluar_idx=None):
+    """Simula destinos para el manifiesto DIAN. Regla: dentro de UN manifiesto, por cada
+    CASILLERO la PRIMERA aparición conserva destino real; las siguientes reciben destino
+    colombiano simulado (fake). La simulación va en columnas *_SIM + bandera
+    _DESTINO_SIMULADO; los datos reales nunca se pierden.
+
+    df_manifiesto: todas las filas de UN manifiesto (viejas congeladas + nuevas, o solo
+        nuevas en modo crear).
+    filas_a_evaluar_idx: índices (labels) de las filas NUEVAS que se pueden simular en
+        esta pasada. Si es None, se evalúan todas. Las filas fuera de ese conjunto son
+        CONGELADAS: no se tocan sus columnas _SIM/bandera, pero SÍ cuentan para decidir
+        si un casillero 'ya apareció' (solo si su aparición fue real).
+    """
+    df = df_manifiesto.copy()
+
+    # Asegurar columnas sin borrar valores existentes (filas congeladas los conservan).
+    for sim_col in _DESTINO_SIM_COLS.values():
+        if sim_col not in df.columns:
+            df[sim_col] = pd.NA
+    if "_DESTINO_SIMULADO" not in df.columns:
+        df["_DESTINO_SIMULADO"] = pd.NA
+
+    evaluables = set(df.index) if filas_a_evaluar_idx is None else set(filas_a_evaluar_idx)
+
+    fake = Faker("es_CO")
+    vistos_real = set()   # casilleros con una aparición REAL en este manifiesto
+
+    for idx in df.index:
+        cas = _norm_casillero(df.at[idx, "CASILLERO"]) if "CASILLERO" in df.columns else ""
+
+        # Casillero vacío -> nunca se simula ni cuenta como repetido.
+        if not cas:
+            if idx in evaluables:
+                df.at[idx, "_DESTINO_SIMULADO"] = False
+            continue
+
+        # Fila CONGELADA: respetar tal cual. Si su aparición es real (bandera False/NA),
+        # el casillero cuenta como 'ya visto real'.
+        if idx not in evaluables:
+            flag = df.at[idx, "_DESTINO_SIMULADO"]
+            es_simulada = (not pd.isna(flag)) and bool(flag)
+            if not es_simulada:
+                vistos_real.add(cas)
+            continue
+
+        # Fila NUEVA (evaluable).
+        if cas in vistos_real:
+            # El casillero ya tuvo aparición real -> SIMULAR destino.
+            d = _build_destinatario_fake(fake)
+            for real_col, sim_col in _DESTINO_SIM_COLS.items():
+                df.at[idx, sim_col] = d[real_col]
+            df.at[idx, "_DESTINO_SIMULADO"] = True
+        else:
+            # Primera aparición real de este casillero en el manifiesto.
+            df.at[idx, "_DESTINO_SIMULADO"] = False
+            vistos_real.add(cas)
+
+    return df
+
+
+def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.DataFrame, df_p=None, manifiesto_destino=None):
+    """Cruza pistoleo (A) × Envíos Encargomio (B), arma un manifiesto en formato
+    cajas (INFO MANIFIESTO) y lo concatena con el histórico propio.
+
+    Un envío = una fila. Llave: 'guia' (número de envío, único por fila). El dedup
+    contra el histórico es por 'guia', keep="first" (el histórico manda: un envío ya
+    registrado no se reprocesa).
+
+    Modos:
+    - manifiesto_destino is None -> CREAR NUEVO: las filas nuevas reciben el siguiente
+      número de la secuencia (2000001, +1).
+    - manifiesto_destino = número -> AGREGAR: las filas nuevas heredan ese manifiesto y
+      el contador NO avanza.
+
+    Las filas nuevas se sellan con FECHA_MANIFIESTO = hoy (Miami). Devuelve
+    (df_concat, manifiesto_usado, n_ia, guias_sin_peso, sin_categoria)."""
     MAN_BASE = 2000001
 
     df_a = df_a.copy()
     df_b = df_b.copy()
     df_a["Envio"] = _clean_str_series(df_a["Envio"])
-    df_a = df_a.drop_duplicates(subset=["Envio"], keep="first")
-    df_b["NUMERO ENVIO"] = _clean_str_series(df_b["NUMERO ENVIO"])
+    df_a["guia"] = df_a["Envio"]
+    df_a = df_a.drop_duplicates(subset=["guia"], keep="first")
 
+    # --- Histórico: normalizar la llave 'guia' ---
+    hist = hist.copy() if hist is not None else pd.DataFrame()
+    if "guia" not in hist.columns and "GUIA" in hist.columns:
+        hist = hist.rename(columns={"GUIA": "guia"})
+    if not hist.empty and "guia" in hist.columns:
+        hist["guia"] = _clean_str_series(hist["guia"])
+
+    # --- B: renombres, llave 'guia' (el remitente se simula por fila más abajo) ---
+    df_b["NUMERO ENVIO"] = _clean_str_series(df_b["NUMERO ENVIO"])
     alias_cols = {
         "DIRECCIÓN DESTINO": "DESTINO DIRECCION",
         "DIRECCIÃ“N DESTINO": "DESTINO DIRECCION",
@@ -543,38 +713,68 @@ def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.
         "DEPARTAMENTO DESTINO": "DESTINO ESTADO",
     })
 
-    df_b["COMPAÑÍA REMITENTE"] = "Largo Easy Corp"
-    df_b["REMITENTE DIRECCION"] = "11860 SW 144th Ct Ste 2"
-    df_b["REMITENTE TELEFONO"] = "3053996614"
-    df_b["REMITENTE CIUDAD"] = "Miami"
-    df_b["REMITENTE ESTADO"] = "FL"
-
-    df_a = df_a.rename(columns={"Envio": "guia"})
     df_b = df_b.rename(columns={"NUMERO ENVIO": "guia"})
-    df_a["guia"] = _clean_str_series(df_a["guia"])
     df_b["guia"] = _clean_str_series(df_b["guia"])
-    if "CATEGORÍAS PRODUCTOS" in df_b.columns:
-        df_b = df_b.rename(columns={"CATEGORÍAS PRODUCTOS": "CONTENIDO"})
 
     cols_b = [
-        "guia", "CASILLERO", "VALOR", "COMPAÑÍA REMITENTE", "REMITENTE DIRECCION",
-        "REMITENTE CIUDAD", "REMITENTE ESTADO", "NOMBRE DESTINO", "DESTINO DIRECCION",
-        "DESTINO CIUDAD", "DESTINO ESTADO", "CONTENIDO", "PESO",
+        "guia", "CASILLERO", "VALOR", "NOMBRE DESTINO", "DESTINO DIRECCION",
+        "DESTINO CIUDAD", "DESTINO ESTADO", "PESO",
     ]
     cols_b = [c for c in cols_b if c in df_b.columns]
-    df_b_sel = df_b[cols_b].rename(columns={"PESO": "PESO LIBRAS"})
+    # B viene una vez por envío: dedup por guía (defensivo, evita que una guía
+    # duplicada en B infle el merge).
+    df_b_sel = df_b[cols_b].drop_duplicates(subset=["guia"], keep="first").rename(columns={"PESO": "PESO LIBRAS"})
 
+    # --- Merge por guía (cada envío trae destinatario/peso de B) ---
     df_final = df_a.merge(df_b_sel, how="left", on="guia")
     df_final["PIEZAS"] = 1
-    df_final["VALOR DECLARADO"] = np.random.randint(91, 100, size=len(df_final))
-    df_final["POSICION ARANCELARIA"] = "980720"
+
+    # Remitente SIMULADO por fila (manifiestos de Miami): un remitente distinto por cada
+    # fila. Faker se instancia UNA sola vez fuera del loop por eficiencia. El TELEFONO se
+    # conserva en el DataFrame/histórico aunque el formato CAJAS no lo imprima.
+    _fake = Faker("en_US")
+    _rems = [_remitente_simulado_miami(_fake) for _ in range(len(df_final))]
+    for _rcol in ("COMPAÑÍA REMITENTE", "REMITENTE DIRECCION", "REMITENTE TELEFONO",
+                  "REMITENTE CIUDAD", "REMITENTE ESTADO"):
+        df_final[_rcol] = [r[_rcol] for r in _rems]
+
+    # (B) VALOR DECLARADO: usa VALOR_A solo si es número válido y != 0; en cualquier
+    #     otro caso (NaN o 0) -> random 90–199.
+    _va = pd.to_numeric(df_final["VALOR_A"], errors="coerce") if "VALOR_A" in df_final.columns else pd.Series(np.nan, index=df_final.index)
+    _usar_va = _va.notna() & (_va != 0)
+    _rand_val = np.random.randint(90, 200, size=len(df_final))
+    df_final["VALOR DECLARADO"] = np.where(_usar_va, _va, _rand_val)
+
+    # (C) POSICION ARANCELARIA: código válido (^\d{4}\.\d) -> tal cual; CUALQUIER otro
+    #     caso (0, Comercial, Regular, vacío/NaN) -> "980720".
+    _POS_RE = re.compile(r"^\d{4}\.\d")
+
+    def _posicion_arancelaria(p):
+        if p is None or pd.isna(p):
+            return "980720"
+        s = str(p).strip()
+        if _POS_RE.match(s):
+            return s
+        return "980720"
+
+    if "POSICION_A" in df_final.columns:
+        df_final["POSICION ARANCELARIA"] = df_final["POSICION_A"].map(_posicion_arancelaria)
+    else:
+        df_final["POSICION ARANCELARIA"] = "980720"
+
     df_final["PESO LIBRAS"] = pd.to_numeric(df_final["PESO LIBRAS"], errors="coerce")
     df_final["PESO KILOS"] = df_final["PESO LIBRAS"] / 2.20462
     df_final["FECHA GUIA"] = pd.to_datetime(datetime.now(ZoneInfo("America/New_York")).date())
-    if "CONTENIDO" not in df_final.columns:
+
+    # (D) CONTENIDO inicial desde A (DESCRIPCION_A), NO desde B. Vacío -> NA para que
+    # la IA lo reclasifique (misma lógica de enriquecer_contenido_ia y garantías).
+    if "DESCRIPCION_A" in df_final.columns:
+        _desc = df_final["DESCRIPCION_A"].astype("string").str.strip()
+        df_final["CONTENIDO"] = _desc.mask(_desc.isna() | (_desc == ""), pd.NA)
+    else:
         df_final["CONTENIDO"] = pd.NA
 
-    # Guías pistoleadas sin cruce en B / sin peso válido (informativo, no bloquea)
+    # Guías sin cruce en B / sin peso válido (informativo, no bloquea)
     _peso_new = df_final["PESO LIBRAS"]
     guias_sin_peso = (
         df_final.loc[_peso_new.isna() | (_peso_new <= 0), "guia"]
@@ -583,26 +783,36 @@ def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.
         .tolist()
     )
 
-    hist = hist.copy() if hist is not None else pd.DataFrame()
-    if "guia" not in hist.columns and "GUIA" in hist.columns:
-        hist = hist.rename(columns={"GUIA": "guia"})
-    if not hist.empty and "guia" in hist.columns:
-        hist["guia"] = _clean_str_series(hist["guia"])
-
+    # Lote nuevo = guías de A que NO están en el histórico (para la IA y las garantías).
     guias_hist_set = set(hist["guia"].dropna()) if ("guia" in hist.columns and not hist.empty) else set()
     guias_nuevas = set(df_final["guia"].dropna()) - guias_hist_set
 
+    # --- Concat + dedup por guia (histórico manda) ---
     df_concat = pd.concat([hist, df_final], ignore_index=True)
     df_concat = df_concat.drop_duplicates(subset=["guia"], keep="first").reset_index(drop=True)
 
     if "MANIFIESTO" not in df_concat.columns:
         df_concat["MANIFIESTO"] = pd.NA
     man_num = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce")
-    mx = man_num[man_num >= MAN_BASE].max()
-    nuevo = int(mx) + 1 if pd.notna(mx) else MAN_BASE
-    df_concat.loc[man_num.isna(), "MANIFIESTO"] = nuevo
+    if manifiesto_destino is None:
+        # CREAR NUEVO: siguiente número de la secuencia (max + 1).
+        mx = man_num[man_num >= MAN_BASE].max()
+        manifiesto_usado = int(mx) + 1 if pd.notna(mx) else MAN_BASE
+    else:
+        # AGREGAR: las filas nuevas heredan el manifiesto destino; el contador NO avanza.
+        manifiesto_usado = int(manifiesto_destino)
+    df_concat.loc[man_num.isna(), "MANIFIESTO"] = manifiesto_usado
     df_concat["MANIFIESTO"] = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce").astype("Int64")
 
+    # FECHA_MANIFIESTO: sella las filas NUEVAS con la fecha de hoy (Miami); las viejas
+    # conservan la suya. Si el histórico viejo no trae la columna, se crea (NaT).
+    _hoy_miami = pd.to_datetime(datetime.now(ZoneInfo("America/New_York")).date())
+    if "FECHA_MANIFIESTO" not in df_concat.columns:
+        df_concat["FECHA_MANIFIESTO"] = pd.NaT
+    _es_nueva = _clean_str_series(df_concat["guia"]).isin(guias_nuevas)
+    df_concat.loc[_es_nueva, "FECHA_MANIFIESTO"] = _hoy_miami
+
+    # IA: clasifica CONTENIDO vacío/genérico por guia, SOLO sobre el lote nuevo.
     n_ia = 0
     if df_p is not None:
         try:
@@ -612,20 +822,37 @@ def procesar_envios_encargomio(df_a: pd.DataFrame, df_b: pd.DataFrame, hist: pd.
         except Exception:
             n_ia = -1
 
-    # GARANTÍA: ninguna categoría 'Otro'/genérica puede quedar en el lote nuevo.
-    # Cubre TODOS los casos: sin archivo P, sin producto en casillero, o IA caída.
-    # Lo que no se pudo clasificar queda EN BLANCO (nunca 'Otro') y se marca.
+    # GARANTÍA anti-'Otro' SOLO sobre el lote nuevo (por guia): lo que quede
+    # genérico/vacío se deja EN BLANCO (nunca 'Otro') y se marca.
     if "CONTENIDO" not in df_concat.columns:
         df_concat["CONTENIDO"] = pd.NA
     df_concat["CONTENIDO"] = df_concat["CONTENIDO"].astype("string")
     gen_lote = (
         df_concat["CONTENIDO"].map(_es_categoria_generica)
-        & _clean_str_series(df_concat["guia"]).isin(set(guias_nuevas))
+        & _clean_str_series(df_concat["guia"]).isin(guias_nuevas)
     )
     df_concat.loc[gen_lote, "CONTENIDO"] = pd.NA
     sin_categoria = df_concat.loc[gen_lote, "guia"].dropna().astype(str).tolist()
 
-    return df_concat, int(nuevo), n_ia, guias_sin_peso, sin_categoria
+    # --- Simulación de destino (crear nuevo y agregar) ---
+    # Asegurar columnas de simulación en TODO el histórico (para que el guardado en
+    # Dropbox sea consistente; las filas viejas que no las tengan quedan en pd.NA).
+    for _c in list(_DESTINO_SIM_COLS.values()) + ["_DESTINO_SIMULADO"]:
+        if _c not in df_concat.columns:
+            df_concat[_c] = pd.NA
+    # Filas del manifiesto usado. En "crear nuevo" son todas nuevas; en "agregar" incluye
+    # las VIEJAS congeladas + las NUEVAS. Solo las nuevas (guias_nuevas) son evaluables:
+    # las viejas cuentan para "casillero ya visto" pero no se re-simulan.
+    _man_num = pd.to_numeric(df_concat["MANIFIESTO"], errors="coerce")
+    _idx_manifiesto = list(df_concat.index[_man_num == manifiesto_usado])
+    _guia_clean = _clean_str_series(df_concat["guia"])
+    _idx_evaluar = [i for i in _idx_manifiesto if _guia_clean.at[i] in guias_nuevas]
+    if _idx_manifiesto:
+        _sub = simular_destinos_manifiesto(df_concat.loc[_idx_manifiesto], filas_a_evaluar_idx=_idx_evaluar)
+        for _c in list(_DESTINO_SIM_COLS.values()) + ["_DESTINO_SIMULADO"]:
+            df_concat.loc[_idx_manifiesto, _c] = _sub[_c]
+
+    return df_concat, int(manifiesto_usado), n_ia, guias_sin_peso, sin_categoria
 
 
 # -----------------------------
@@ -1790,6 +2017,42 @@ elif modo == "Envios Encargomio":
 
     DBX_FILE_PATH_EE = "/Manifiestos/Envios_encargomio.xlsx"
 
+    modo_ee = st.radio(
+        "¿Qué querés hacer?",
+        ["Crear manifiesto nuevo", "Agregar a manifiesto existente"],
+        horizontal=True,
+        key="modo_ee",
+    )
+
+    manifiesto_destino = None
+    if modo_ee == "Agregar a manifiesto existente":
+        try:
+            _dbx_sel = get_dbx()
+            _, _res_sel = _dbx_sel.files_download(DBX_FILE_PATH_EE)
+            _hist_sel = pd.read_excel(io.BytesIO(_res_sel.content), sheet_name=0)
+        except dropbox.exceptions.ApiError:
+            _hist_sel = pd.DataFrame()
+
+        _mn = (
+            pd.to_numeric(_hist_sel["MANIFIESTO"], errors="coerce").dropna()
+            if "MANIFIESTO" in _hist_sel.columns else pd.Series(dtype="float")
+        )
+        if _mn.empty:
+            st.warning("Aún no hay manifiestos en el histórico. Crea uno en 'Crear manifiesto nuevo' primero.")
+        else:
+            _ult = int(_mn.max())   # último = número MÁS ALTO
+            _fecha_txt = ""
+            if "FECHA_MANIFIESTO" in _hist_sel.columns:
+                _f = pd.to_datetime(
+                    _hist_sel.loc[pd.to_numeric(_hist_sel["MANIFIESTO"], errors="coerce") == _ult, "FECHA_MANIFIESTO"],
+                    errors="coerce",
+                ).max()
+                if pd.notna(_f):
+                    _fecha_txt = pd.Timestamp(_f).date().isoformat()
+            _label = f"{_fecha_txt} — {_ult}" if _fecha_txt else str(_ult)
+            st.selectbox("Manifiesto destino", options=[_label], key="man_destino_sel")
+            manifiesto_destino = _ult
+
     ee1, ee2, ee3 = st.columns(3)
     with ee1:
         up_a_ee = st.file_uploader("A — Pistoleo (Envio)", type=["xlsx", "xls"], key="up_a_ee")
@@ -1798,10 +2061,11 @@ elif modo == "Envios Encargomio":
     with ee3:
         up_p_ee = st.file_uploader("P — Productos (para CONTENIDO por IA)", type=["xlsx", "xls"], key="up_p_ee")
 
+    _agregar_sin_manifiesto = (modo_ee == "Agregar a manifiesto existente") and manifiesto_destino is None
     run_ee = st.button(
         "Procesar y actualizar histórico Envios Encargomio",
         type="primary",
-        disabled=not (up_a_ee and up_b_ee),
+        disabled=(not (up_a_ee and up_b_ee)) or _agregar_sin_manifiesto,
     )
 
     if run_ee:
@@ -1816,9 +2080,10 @@ elif modo == "Envios Encargomio":
         df_b_ee = pd.read_excel(up_b_ee)
         df_p_ee = pd.read_excel(up_p_ee) if up_p_ee is not None else None
 
-        df_concat_ee, nuevo_man, n_ia, guias_sin_peso, guias_sin_categoria = procesar_envios_encargomio(
-            df_a_ee, df_b_ee, hist_ee, df_p_ee
+        df_concat_ee, man_usado, n_ia, guias_sin_peso, guias_sin_categoria = procesar_envios_encargomio(
+            df_a_ee, df_b_ee, hist_ee, df_p_ee, manifiesto_destino=manifiesto_destino
         )
+        _nuevos = len(df_concat_ee) - len(hist_ee)   # envíos nuevos que entraron
 
         excel_hist_ee = dfs_to_excel_bytes({"HISTORICO": df_concat_ee})
         dbx.files_upload(
@@ -1830,9 +2095,13 @@ elif modo == "Envios Encargomio":
             msg_ia = f"CONTENIDO por IA: {n_ia} guía(s)"
         else:
             msg_ia = "IA no disponible en esta corrida (se conservó el CONTENIDO existente)"
+        if manifiesto_destino is None:
+            _accion = f"Manifiesto NUEVO {man_usado} creado con {_nuevos} envío(s)"
+        else:
+            _accion = f"Se agregaron {_nuevos} envío(s) al manifiesto {man_usado}"
         st.success(
             f"Histórico Envios Encargomio actualizado ({len(df_concat_ee)} filas). "
-            f"Nuevo manifiesto: {nuevo_man}. {msg_ia}."
+            f"{_accion}. {msg_ia}."
         )
 
         if guias_sin_peso:
@@ -1902,11 +2171,55 @@ elif modo == "Envios Encargomio":
 
                 st.dataframe(df_info, use_container_width=True)
 
-                data_info = info_manifiesto_excel_bytes(df_info)
                 fecha_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-                st.download_button(
-                    label=f"Descargar {fecha_str}-{int(man_sel)}-CAJAS.xlsx",
-                    data=data_info,
-                    file_name=f"{fecha_str}-{int(man_sel)}-CAJAS.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+
+                # Filas simuladas de este manifiesto (bandera _DESTINO_SIMULADO == True)
+                if "_DESTINO_SIMULADO" in df_m.columns:
+                    _sim_mask = df_m["_DESTINO_SIMULADO"].apply(lambda v: (not pd.isna(v)) and bool(v))
+                else:
+                    _sim_mask = pd.Series(False, index=df_m.index)
+
+                # ---------- DIAN: destino simulado donde aplique (formato cajas, sin casillero) ----------
+                df_dian_src = df_m.copy()
+                for _real, _sim in _DESTINO_SIM_COLS.items():
+                    if _real in df_dian_src.columns and _sim in df_dian_src.columns:
+                        df_dian_src.loc[_sim_mask, _real] = df_dian_src.loc[_sim_mask, _sim]
+                df_dian = build_info_manifiesto_df(df_dian_src)
+                dian_bytes = info_manifiesto_excel_bytes(df_dian)
+
+                # ---------- Astrid: destino REAL + CASILLERO al final + filas simuladas en rojo ----------
+                df_astrid = df_info.copy()                       # real intacto (mismas filas/orden que df_m)
+                df_astrid["CASILLERO"] = (
+                    df_m["CASILLERO"].values if "CASILLERO" in df_m.columns else pd.NA
                 )
+                _guias_sim = {
+                    _normalize_excel_key(g)
+                    for g in df_m.loc[_sim_mask, "guia"].tolist()
+                    if _normalize_excel_key(g)
+                }
+                # Se genera con info_manifiesto_excel_bytes (conserva el pie de totales) y se
+                # pinta encima abriendo con openpyxl -> Astrid mantiene totales + rojo.
+                _astrid_bytes = info_manifiesto_excel_bytes(df_astrid)
+                _wb = load_workbook(io.BytesIO(_astrid_bytes))
+                _paint_rows_red_by_guia(_wb["INFO MANIFIESTO"], "GUIA / consignment", _guias_sim)
+                _buf = io.BytesIO()
+                _wb.save(_buf)
+                _buf.seek(0)
+                astrid_bytes = _buf.getvalue()
+
+                st.caption(f"Filas con destino simulado en este manifiesto: {int(_sim_mask.sum())}")
+                cold1, cold2 = st.columns(2)
+                with cold1:
+                    st.download_button(
+                        label=f"⬇ DIAN (destino simulado)",
+                        data=dian_bytes,
+                        file_name=f"{fecha_str}-{int(man_sel)}-DIAN-CAJAS.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                with cold2:
+                    st.download_button(
+                        label=f"⬇ Astrid (real + casillero, simuladas en rojo)",
+                        data=astrid_bytes,
+                        file_name=f"{fecha_str}-{int(man_sel)}-ASTRID-CAJAS.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )

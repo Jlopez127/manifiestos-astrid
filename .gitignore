@@ -1,6 +1,9 @@
 # Secrets de Streamlit (NO subir)
 .streamlit/secrets.toml
 
+# Variables de entorno locales (API keys) — NO subir
+.env
+
 # Cache / basura python
 __pycache__/
 *.pyc
