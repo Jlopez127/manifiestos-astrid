@@ -1,4 +1,9 @@
 streamlit
+# starlette 1.4.0 hizo obligatorio el kwarg `thread_minimum_size` en GZipResponder.__init__,
+# y el _MediaAwareGZipResponder de Streamlit (hasta 1.61.0) no lo pasa -> TypeError en cada
+# request comprimido y la app no carga. Streamlit permite starlette<2, así que hay que
+# frenarlo acá. Quitar este pin cuando Streamlit soporte starlette >= 1.4.
+starlette>=0.46,<1.4
 pandas
 openpyxl
 dropbox

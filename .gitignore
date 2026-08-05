@@ -29,3 +29,5 @@ Guias_fenix.xlsx
 
 # Script de prueba local
 test_fenix.py
+# Logs descargados de Streamlit Cloud
+logs-*.txt
